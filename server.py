@@ -297,10 +297,14 @@ def run_chat(messages: list[dict], thinking: bool, callback):
         content = ""
         sent_len = 0
         search_detected = False
-        started = False  # suppress leading whitespace until real content begins
+        started = False
 
         for token in vllm_stream(full_messages, thinking):
             content += token
+
+            # Check if client is still connected
+            if not callback(""):
+                return  # client disconnected — abort
 
             # Suppress leading newlines/whitespace (model often emits blank
             # lines before the actual answer, especially after tool-use rounds)
@@ -427,12 +431,16 @@ class ChatHandler(http.server.SimpleHTTPRequestHandler):
         self.close_connection = True  # ensure socket closes after SSE response
         self.end_headers()
 
+        client_connected = [True]  # mutable flag for the callback
+
         def callback(data):
-            try:
-                self.wfile.write(f"data: {data}\n\n".encode())
-                self.wfile.flush()
-            except Exception:
-                pass  # Client disconnected
+            if data:  # skip empty writes (used as connection check)
+                try:
+                    self.wfile.write(f"data: {data}\n\n".encode())
+                    self.wfile.flush()
+                except Exception:
+                    client_connected[0] = False
+            return client_connected[0]
 
         run_chat(messages, thinking, callback)
 
