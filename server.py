@@ -238,14 +238,19 @@ def format_search_results_with_pages(results: list[dict], pages: dict) -> str:
 
 
 # ── vLLM helpers ──────────────────────────────────────────────────────────────
-def vllm_complete(messages: list[dict], thinking: bool = True) -> str:
-    """Send a non-streaming completion to vLLM. Returns the full content."""
+def vllm_stream(messages: list[dict], thinking: bool = True):
+    """Stream a completion from vLLM, yielding content chunks as they arrive.
+
+    Yields:
+        str — each chunk of content text from the model.
+    """
     payload = json.dumps({
         "model": MODEL,
         "messages": messages,
         "max_tokens": 8192,
         "temperature": 0.7,
         "top_p": 0.95,
+        "stream": True,
         "chat_template_kwargs": {"enable_thinking": thinking},
     }).encode()
     req = urllib.request.Request(
@@ -254,62 +259,117 @@ def vllm_complete(messages: list[dict], thinking: bool = True) -> str:
         headers={"Content-Type": "application/json", "Authorization": "Bearer EMPTY"},
     )
     with urllib.request.urlopen(req, timeout=120) as resp:
-        data = json.loads(resp.read())
-    return data["choices"][0]["message"].get("content", "")
+        buffer = ""
+        for raw_line in resp:
+            line = raw_line.decode("utf-8", errors="replace")
+            if not line.startswith("data: "):
+                continue
+            data = line[6:].strip()
+            if data == "[DONE]":
+                break
+            try:
+                chunk = json.loads(data)
+                delta = chunk["choices"][0].get("delta", {})
+                content_piece = delta.get("content")
+                if content_piece:
+                    yield content_piece
+            except (json.JSONDecodeError, KeyError, IndexError):
+                continue
 
 
 # ── Chat handler with tool-use loop ──────────────────────────────────────────
+# Hold back this many chars from the streaming edge — enough to detect a
+# [[search]] or [[/search]] marker that arrives split across token chunks.
+_HOLD_BACK = len("[[/search]]")  # 10
+
+
 def run_chat(messages: list[dict], thinking: bool, callback):
-    """Run the chat loop with tool use. Sends SSE events via callback(data_str)."""
+    """Run the chat loop with tool use. Sends SSE events via callback(data_str).
+
+    Tokens are streamed to the client in real-time. A hold-back buffer
+    prevents partial [[search]] markers from leaking to the client. If a
+    marker is detected, streaming pauses, the search runs, and results are
+    fed back to the model for a new streaming round.
+    """
     full_messages = [{"role": "system", "content": build_system_prompt()}] + messages
 
-    # Maximum tool iterations to prevent infinite loops
     for iteration in range(5):
-        # Get model response
-        content = vllm_complete(full_messages, thinking)
+        content = ""
+        sent_len = 0
+        search_detected = False
+        started = False  # suppress leading whitespace until real content begins
 
-        # Check for tool call markers
-        # Primary: properly closed tags [[search]]query[[/search]]
-        search_match = re.search(r"\[\[search\]\](.+?)\[\[/search\]\]", content, re.DOTALL)
-        # Fallback: model forgot closing tag — grab everything after [[search]]
-        if not search_match:
-            search_match = re.search(r"\[\[search\]\](.+)", content, re.DOTALL)
-        if search_match:
-            query = search_match.group(1).strip()
-            # Send everything before the tool call — strip any leftover markers
-            before = re.sub(r"\[\[/?search\]\]", "", content[:search_match.start()]).strip()
-            if before:
-                callback(json.dumps({"type": "content", "text": before}))
+        for token in vllm_stream(full_messages, thinking):
+            content += token
 
-            # Notify client that a tool call is happening
-            callback(json.dumps({"type": "tool_call", "tool": "web_search", "query": query}))
+            # Suppress leading newlines/whitespace (model often emits blank
+            # lines before the actual answer, especially after tool-use rounds)
+            if not started:
+                stripped = content.lstrip()
+                if stripped:
+                    content = stripped  # discard leading whitespace
+                else:
+                    continue  # all whitespace so far — keep buffering
 
-            # Run the search
-            results = search_web(query)
+            # Check for complete marker
+            if "[[search]]" in content:
+                search_detected = True
+                started = True
+                marker_idx = content.index("[[search]]")
+                # Flush everything between what was already sent and the marker
+                if marker_idx > sent_len:
+                    chunk = content[sent_len:marker_idx]
+                    callback(json.dumps({"type": "content", "text": chunk}))
+                continue  # keep buffering but don't stream past marker
 
-            # Fetch full page content in parallel (top N results)
-            pages = fetch_pages_parallel(results)
-            result_text = format_search_results_with_pages(results, pages)
+            if search_detected:
+                continue  # buffering only — marker text is not real content
 
-            # Notify client of results
-            callback(json.dumps({"type": "tool_result", "tool": "web_search", "results": result_text, "pages_fetched": len(pages)}))
+            # Stream content to client, holding back _HOLD_BACK chars
+            # in case a marker is forming at the trailing edge
+            safe_end = max(sent_len, len(content) - _HOLD_BACK)
+            if safe_end > sent_len:
+                callback(json.dumps({"type": "content", "text": content[sent_len:safe_end]}))
+                sent_len = safe_end
+                started = True  # real content has begun
 
-            # Add assistant response (stripped of markers) and tool result
-            response_clean = re.sub(r"\[\[/?search\]\]", "", content).strip()
-            full_messages.append({"role": "assistant", "content": response_clean})
-            full_messages.append({"role": "tool", "content": result_text})
+        # Stream complete — process the accumulated response
 
-            # Continue the loop — model sees the results and generates a proper answer
-            continue
+        if search_detected:
+            # Flush any held-back non-marker content before the marker
+            marker_idx = content.index("[[search]]")
+            if marker_idx > sent_len:
+                callback(json.dumps({"type": "content", "text": content[sent_len:marker_idx]}))
 
-        # No tool call — this is the final answer
-        callback(json.dumps({"type": "content", "text": content}))
-        full_messages.append({"role": "assistant", "content": content})
+            # Extract search query
+            search_match = re.search(r"\[\[search\]\](.+?)(?:\[\[/search\]\])?$", content, re.DOTALL)
+            if search_match:
+                query = search_match.group(1).replace("[[/search]]", "").strip()
+
+                callback(json.dumps({"type": "tool_call", "tool": "web_search", "query": query}))
+
+                results = search_web(query)
+                pages = fetch_pages_parallel(results)
+                result_text = format_search_results_with_pages(results, pages)
+
+                callback(json.dumps({"type": "tool_result", "tool": "web_search", "results": result_text, "pages_fetched": len(pages)}))
+
+                response_clean = re.sub(r"\[\[/?search\]\]", "", content).strip()
+                full_messages.append({"role": "assistant", "content": response_clean})
+                full_messages.append({"role": "tool", "content": result_text})
+                continue
+            # Edge case: marker detected but regex failed — treat as content
+
+        # No tool call — flush any remaining held-back content, then done
+        content_clean = re.sub(r"\[\[/?search\]\]", "", content)
+        if len(content_clean) > sent_len:
+            callback(json.dumps({"type": "content", "text": content_clean[sent_len:]}))
+        full_messages.append({"role": "assistant", "content": content_clean.strip()})
         callback(json.dumps({"type": "done"}))
         return
 
-    # If we hit max iterations, return what we have
-    callback(json.dumps({"type": "content", "text": "\n[Search iterations exceeded maximum. Based on available results...]"}) )
+    # If we hit max iterations
+    callback(json.dumps({"type": "content", "text": "\n[Search iterations exceeded maximum.]"}))
     callback(json.dumps({"type": "done"}))
 
 

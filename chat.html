@@ -69,7 +69,7 @@ body {
 }
 .msg.assistant {
   background: var(--surface);
-  align-self: flex-end;
+  align-self: flex-start;
   border-bottom-left-radius: 4px;
   border: 1px solid rgba(255,255,255,0.05);
   max-width: 90%;
@@ -209,6 +209,19 @@ body {
 }
 #clear-btn:hover { color: var(--text); }
 .typing { color: var(--text-dim); font-style: italic; }
+.typing-indicator { display: flex; align-items: center; gap: 8px; color: var(--text-dim); font-style: italic; }
+.typing-dots { display: inline-flex; gap: 4px; }
+.typing-dots span {
+  width: 6px; height: 6px; border-radius: 50%;
+  background: var(--text-dim);
+  animation: typing-dot 1.4s infinite ease-in-out;
+}
+.typing-dots span:nth-child(2) { animation-delay: 0.2s; }
+.typing-dots span:nth-child(3) { animation-delay: 0.4s; }
+@keyframes typing-dot {
+  0%, 60%, 100% { opacity: 0.3; transform: scale(0.8); }
+  30% { opacity: 1; transform: scale(1.2); }
+}
 code { background: rgba(255,255,255,0.08); padding: 2px 6px; border-radius: 4px; font-size: 13px; }
 pre { background: rgba(0,0,0,0.3); padding: 12px; border-radius: 8px; overflow-x: auto; margin: 8px 0; }
 pre code { background: none; padding: 0; }
@@ -286,7 +299,12 @@ function addMsg(role, content) {
   tag.className = 'role-tag';
   tag.textContent = role === 'user' ? 'You' : 'Assistant';
   const body = document.createElement('div');
-  body.innerHTML = formatContent(content);
+  // Placeholder HTML (starts with '<') is set directly; everything else is formatted
+  if (content.startsWith('<')) {
+    body.innerHTML = content;
+  } else {
+    body.innerHTML = formatContent(content);
+  }
   div.appendChild(tag);
   div.appendChild(body);
   chat.appendChild(div);
@@ -376,7 +394,7 @@ async function sendMessage() {
   document.getElementById('send').disabled = true;
 
   const thinking = document.getElementById('think-toggle').checked;
-  let assistantBody = addMsg('assistant', '<span class="typing">Thinking...</span>');
+  let assistantBody = addMsg('assistant', '<div class="typing-indicator"><span>Thinking</span><span class="typing-dots"><span></span><span></span><span></span></span></div>');
 
   try {
     const response = await fetch(API_URL, {
@@ -456,7 +474,7 @@ async function sendMessage() {
               last.querySelector('.tool-content').appendChild(resultsEl);
             }
             // Re-add the assistant placeholder
-            assistantBody = addMsg('assistant', '<span class="typing">Processing results...</span>');
+            assistantBody = addMsg('assistant', '<div class="typing-indicator"><span>Processing results</span><span class="typing-dots"><span></span><span></span><span></span></span></div>');
             document.getElementById('chat').scrollTop = document.getElementById('chat').scrollHeight;
           }
           else if (event.type === 'done') {
