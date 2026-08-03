@@ -25,7 +25,84 @@ body {
   color: var(--text);
   height: 100vh;
   display: flex;
+  flex-direction: row;
+  overflow: hidden;
+}
+/* Sidebar */
+#sidebar {
+  width: 240px;
+  flex-shrink: 0;
+  background: #111;
+  border-right: 1px solid rgba(255,255,255,0.05);
+  display: flex;
   flex-direction: column;
+  transition: margin-left 0.2s ease;
+}
+#sidebar.collapsed { margin-left: -240px; }
+#sidebar-header {
+  padding: 12px 14px;
+  border-bottom: 1px solid rgba(255,255,255,0.05);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+#new-chat-btn {
+  flex: 1;
+  background: var(--surface2);
+  color: var(--text);
+  border: 1px solid rgba(255,255,255,0.1);
+  border-radius: 8px;
+  padding: 8px 12px;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  text-align: center;
+}
+#new-chat-btn:hover { background: var(--accent); }
+#conv-list {
+  flex: 1;
+  overflow-y: auto;
+  padding: 8px;
+}
+.conv-item {
+  padding: 8px 10px;
+  border-radius: 8px;
+  cursor: pointer;
+  font-size: 13px;
+  color: var(--text-dim);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  margin-bottom: 2px;
+  transition: background 0.15s;
+}
+.conv-item:hover { background: rgba(255,255,255,0.05); }
+.conv-item.active { background: var(--surface2); color: var(--text); }
+.conv-item .conv-title {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.conv-item .conv-delete {
+  opacity: 0;
+  flex-shrink: 0;
+  font-size: 14px;
+  color: var(--text-dim);
+  background: none;
+  border: none;
+  cursor: pointer;
+  padding: 0 2px;
+}
+.conv-item:hover .conv-delete { opacity: 0.6; }
+.conv-item .conv-delete:hover { opacity: 1; color: var(--accent); }
+/* Main content */
+#main {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
 }
 #header {
   background: var(--surface);
@@ -231,10 +308,21 @@ a:hover { text-decoration: underline; }
 </head>
 <body>
 
+<div id="sidebar">
+  <div id="sidebar-header">
+    <button id="new-chat-btn" onclick="newChat()">+ New Chat</button>
+  </div>
+  <div id="conv-list"></div>
+</div>
+
+<div id="main">
 <div id="header">
-  <div>
-    <h1>&#129302; Qwen3.6-27B Chat</h1>
-    <div class="subtitle"><span id="status-dot"></span><span id="status-text">Connecting...</span></div>
+  <div style="display: flex; align-items: center; gap: 10px;">
+    <button id="sidebar-toggle" onclick="toggleSidebar()" style="background: none; border: none; color: var(--text-dim); cursor: pointer; font-size: 18px; padding: 4px;">☰</button>
+    <div>
+      <h1>&#129302; Qwen3.6-27B Chat</h1>
+      <div class="subtitle"><span id="status-dot"></span><span id="status-text">Connecting...</span></div>
+    </div>
   </div>
   <div id="controls">
     <label><input type="checkbox" id="think-toggle" checked> Thinking</label>
@@ -248,13 +336,125 @@ a:hover { text-decoration: underline; }
   <textarea id="prompt" placeholder="Type a message... (Enter to send, Shift+Enter for new line)" rows="1" onkeydown="handleKey(event)" oninput="autoResize(this)"></textarea>
   <button id="send" onclick="sendMessage()">Send</button>
 </div>
+</div>
 
 <script>
 const API_URL = '/chat';
 let messages = [];
 let busy = false;
+let conversations = [];      // [{id, title, messages}]
+let activeConvId = null;
 
-// Check server status
+// ── Conversation persistence ────────────────────────────────────────────────
+const STORAGE_KEY = 'lan-chat-conversations';
+
+function loadConversations() {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    conversations = raw ? JSON.parse(raw) : [];
+  } catch { conversations = []; }
+  // Restore active conversation
+  const lastId = localStorage.getItem(STORAGE_KEY + ':active');
+  if (lastId && conversations.find(c => c.id === lastId)) {
+    activeConvId = lastId;
+  } else if (conversations.length > 0) {
+    activeConvId = conversations[0].id;
+  }
+}
+
+function saveConversations() {
+  localStorage.setItem(STORAGE_KEY, JSON.stringify(conversations));
+}
+
+function getActiveConv() {
+  return conversations.find(c => c.id === activeConvId);
+}
+
+function newChat() {
+  activeConvId = null;
+  messages = [];
+  document.getElementById('chat').innerHTML = '';
+  renderConvList();
+  saveConversations();
+  document.getElementById('prompt').focus();
+}
+
+function startNewConversation(firstMsg) {
+  const conv = {
+    id: 'c' + Date.now(),
+    title: firstMsg.slice(0, 40) + (firstMsg.length > 40 ? '…' : ''),
+    messages: [{ role: 'user', content: firstMsg }],
+  };
+  conversations.unshift(conv);
+  activeConvId = conv.id;
+  renderConvList();
+  saveConversations();
+}
+
+function switchConversation(convId) {
+  const conv = conversations.find(c => c.id === convId);
+  if (!conv) return;
+  activeConvId = convId;
+  messages = [...conv.messages];
+  localStorage.setItem(STORAGE_KEY + ':active', convId);
+  // Rebuild chat UI
+  const chat = document.getElementById('chat');
+  chat.innerHTML = '';
+  for (const msg of conv.messages) {
+    if (msg.role === 'user') addMsg('user', msg.content);
+    else if (msg.role === 'assistant') addMsg('assistant', msg.content);
+  }
+  renderConvList();
+  document.getElementById('prompt').focus();
+}
+
+function deleteConversation(convId, event) {
+  event.stopPropagation();
+  conversations = conversations.filter(c => c.id !== convId);
+  if (activeConvId === convId) {
+    if (conversations.length > 0) {
+      switchConversation(conversations[0].id);
+    } else {
+      newChat();
+    }
+  }
+  renderConvList();
+  saveConversations();
+}
+
+function renderConvList() {
+  const list = document.getElementById('conv-list');
+  list.innerHTML = '';
+  for (const conv of conversations) {
+    const div = document.createElement('div');
+    div.className = 'conv-item' + (conv.id === activeConvId ? ' active' : '');
+    div.onclick = () => switchConversation(conv.id);
+    const title = document.createElement('span');
+    title.className = 'conv-title';
+    title.textContent = conv.title;
+    const del = document.createElement('button');
+    del.className = 'conv-delete';
+    del.textContent = '×';
+    del.onclick = (e) => deleteConversation(conv.id, e);
+    div.appendChild(title);
+    div.appendChild(del);
+    list.appendChild(div);
+  }
+}
+
+function toggleSidebar() {
+  document.getElementById('sidebar').classList.toggle('collapsed');
+}
+
+function updateActiveConvMessages() {
+  const conv = getActiveConv();
+  if (conv) {
+    conv.messages = [...messages];
+    saveConversations();
+  }
+}
+
+// ── Check server status ─────────────────────────────────────────────────────
 fetch('/chat.html')
   .then(r => {
     document.getElementById('status-dot').classList.add('online');
@@ -390,6 +590,13 @@ async function sendMessage() {
   messages.push({ role: 'user', content: text });
   addMsg('user', text);
 
+  // Create conversation if this is the first message
+  if (!activeConvId) {
+    startNewConversation(text);
+  } else {
+    updateActiveConvMessages();
+  }
+
   busy = true;
   document.getElementById('send').disabled = true;
 
@@ -480,6 +687,7 @@ async function sendMessage() {
           else if (event.type === 'done') {
             // Finalize
             messages.push({ role: 'assistant', content: contentText });
+            updateActiveConvMessages();
             gotDone = true;
           }
         } catch (e) {
@@ -503,8 +711,16 @@ async function sendMessage() {
 }
 
 function clearChat() {
-  messages = [];
-  document.getElementById('chat').innerHTML = '';
+  newChat();
+}
+
+// ── Initialize on page load ─────────────────────────────────────────────────
+loadConversations();
+renderConvList();
+if (activeConvId) {
+  switchConversation(activeConvId);
+} else {
+  newChat();
 }
 
 document.getElementById('prompt').focus();
