@@ -53,12 +53,35 @@ After you output the search marker, the system will run the search and return re
 Search results will be returned after your search marker. Read them carefully and cite sources when relevant."""
 
 
-def build_system_prompt() -> str:
-    """Build the system prompt with current date/time injected."""
-    now = datetime.now()
-    return f"""Current date and time: {now.strftime("%A, %B %d, %Y at %I:%M %p")} ({now.tzname() or "local time"})
+def build_system_prompt(
+    custom_prompt: str = "",
+    include_datetime: bool = True,
+    include_search: bool = True,
+) -> str:
+    """Build the system prompt from optional layers.
 
-{TOOL_SYSTEM_PROMPT}"""
+    Order: date/time → custom prompt → web-search tool instructions.
+    Any layer can be omitted via the boolean flags / empty custom prompt.
+    """
+    parts = []
+
+    if include_datetime:
+        now = datetime.now()
+        parts.append(
+            f"Current date and time: {now.strftime('%A, %B %d, %Y at %I:%M %p')} "
+            f"({now.tzname() or 'local time'})"
+        )
+
+    if custom_prompt and custom_prompt.strip():
+        parts.append(custom_prompt.strip())
+
+    if include_search:
+        parts.append(TOOL_SYSTEM_PROMPT)
+    elif not parts:
+        # Minimal fallback so the model always gets a system message
+        parts.append("You are a helpful AI assistant.")
+
+    return "\n\n".join(parts)
 
 # ── DuckDuckGo search (no API key) ────────────────────────────────────────────
 def search_web(query: str, num_results: int = 5) -> list[dict]:
@@ -283,15 +306,24 @@ def vllm_stream(messages: list[dict], thinking: bool = True):
 _HOLD_BACK = len("[[/search]]")  # 10
 
 
-def run_chat(messages: list[dict], thinking: bool, callback):
-    """Run the chat loop with tool use. Sends SSE events via callback(data_str).
+def run_chat(
+    messages: list[dict],
+    thinking: bool,
+    callback,
+    system_prompt: str = "",
+    include_datetime: bool = True,
+    include_search: bool = True,
+):
+    """Run the chat loop with optional tool use. Sends SSE events via callback(data_str).
 
-    Tokens are streamed to the client in real-time. A hold-back buffer
-    prevents partial [[search]] markers from leaking to the client. If a
-    marker is detected, streaming pauses, the search runs, and results are
-    fed back to the model for a new streaming round.
+    Tokens are streamed to the client in real-time. When include_search is True,
+    a hold-back buffer prevents partial [[search]] markers from leaking; on
+    detection, streaming pauses, the search runs, and results are fed back.
     """
-    full_messages = [{"role": "system", "content": build_system_prompt()}] + messages
+    full_messages = [{
+        "role": "system",
+        "content": build_system_prompt(system_prompt, include_datetime, include_search),
+    }] + messages
 
     for iteration in range(5):
         content = ""
@@ -315,8 +347,8 @@ def run_chat(messages: list[dict], thinking: bool, callback):
                 else:
                     continue  # all whitespace so far — keep buffering
 
-            # Check for complete marker
-            if "[[search]]" in content:
+            # Search markers only honored when web search is enabled
+            if include_search and "[[search]]" in content:
                 search_detected = True
                 started = True
                 marker_idx = content.index("[[search]]")
@@ -329,9 +361,10 @@ def run_chat(messages: list[dict], thinking: bool, callback):
             if search_detected:
                 continue  # buffering only — marker text is not real content
 
-            # Stream content to client, holding back _HOLD_BACK chars
-            # in case a marker is forming at the trailing edge
-            safe_end = max(sent_len, len(content) - _HOLD_BACK)
+            # Stream content to client, holding back _HOLD_BACK chars only
+            # when search is enabled (marker may be forming at the edge)
+            hold = _HOLD_BACK if include_search else 0
+            safe_end = max(sent_len, len(content) - hold)
             if safe_end > sent_len:
                 callback(json.dumps({"type": "content", "text": content[sent_len:safe_end]}))
                 sent_len = safe_end
@@ -339,7 +372,7 @@ def run_chat(messages: list[dict], thinking: bool, callback):
 
         # Stream complete — process the accumulated response
 
-        if search_detected:
+        if include_search and search_detected:
             # Flush any held-back non-marker content before the marker
             marker_idx = content.index("[[search]]")
             if marker_idx > sent_len:
@@ -365,7 +398,7 @@ def run_chat(messages: list[dict], thinking: bool, callback):
             # Edge case: marker detected but regex failed — treat as content
 
         # No tool call — flush any remaining held-back content, then done
-        content_clean = re.sub(r"\[\[/?search\]\]", "", content)
+        content_clean = re.sub(r"\[\[/?search\]\]", "", content) if include_search else content
         if len(content_clean) > sent_len:
             callback(json.dumps({"type": "content", "text": content_clean[sent_len:]}))
         full_messages.append({"role": "assistant", "content": content_clean.strip()})
@@ -424,6 +457,9 @@ class ChatHandler(http.server.SimpleHTTPRequestHandler):
         body = json.loads(self.rfile.read(length)) if length else {}
         messages = body.get("messages", [])
         thinking = body.get("thinking", True)
+        system_prompt = body.get("system_prompt", "")
+        include_datetime = body.get("include_datetime", True)
+        include_search = body.get("include_search", True)
 
         self.send_response(200)
         self.send_header('Content-Type', 'text/event-stream')
@@ -443,7 +479,11 @@ class ChatHandler(http.server.SimpleHTTPRequestHandler):
                     client_connected[0] = False
             return client_connected[0]
 
-        run_chat(messages, thinking, callback)
+        run_chat(
+            messages, thinking, callback, system_prompt,
+            include_datetime=bool(include_datetime),
+            include_search=bool(include_search),
+        )
 
 
 if __name__ == '__main__':

@@ -334,6 +334,93 @@ pre .code-copy-btn.copied { background: #2d5a3d; color: #4ade80; opacity: 1; }
 .msg-copy-btn.copied { opacity: 1 !important; color: #4ade80; }
 a { color: #60a5fa; text-decoration: none; }
 a:hover { text-decoration: underline; }
+/* Settings modal */
+#settings-overlay {
+  display: none;
+  position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+  background: rgba(0,0,0,0.6);
+  z-index: 1000;
+  align-items: center;
+  justify-content: center;
+}
+#settings-overlay.open { display: flex; }
+#settings-modal {
+  background: var(--surface);
+  border: 1px solid rgba(255,255,255,0.1);
+  border-radius: 12px;
+  padding: 20px;
+  width: 90%; max-width: 600px;
+  max-height: 80vh;
+  overflow-y: auto;
+}
+#settings-modal h2 { font-size: 16px; margin-bottom: 12px; }
+#settings-modal textarea {
+  width: 100%;
+  min-height: 200px;
+  background: var(--bg);
+  border: 1px solid rgba(255,255,255,0.1);
+  border-radius: 8px;
+  color: var(--text);
+  padding: 12px;
+  font-size: 13px;
+  font-family: monospace;
+  line-height: 1.5;
+  resize: vertical;
+}
+#settings-modal .hint { font-size: 12px; color: var(--text-dim); margin: 8px 0 12px; }
+#settings-modal .toggle-row {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-bottom: 16px;
+  padding: 12px;
+  background: var(--bg);
+  border-radius: 8px;
+  border: 1px solid rgba(255,255,255,0.06);
+}
+#settings-modal .toggle-row label {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  font-size: 13px;
+  color: var(--text);
+  cursor: pointer;
+  line-height: 1.4;
+}
+#settings-modal .toggle-row label input {
+  margin-top: 2px;
+  accent-color: var(--accent);
+  width: 16px;
+  height: 16px;
+  flex-shrink: 0;
+}
+#settings-modal .toggle-row .toggle-desc {
+  display: block;
+  font-size: 11px;
+  color: var(--text-dim);
+  margin-top: 2px;
+}
+#settings-modal .actions { display: flex; gap: 10px; justify-content: flex-end; }
+#settings-modal button {
+  padding: 8px 16px;
+  border-radius: 8px;
+  border: 1px solid rgba(255,255,255,0.1);
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 600;
+}
+#settings-modal .save-btn { background: var(--accent); color: white; }
+#settings-modal .cancel-btn { background: transparent; color: var(--text-dim); }
+#settings-modal .reset-btn { background: transparent; color: var(--text-dim); font-size: 12px; }
+#gear-btn {
+  background: none;
+  border: none;
+  color: var(--text-dim);
+  cursor: pointer;
+  font-size: 16px;
+  padding: 4px 8px;
+}
+#gear-btn:hover { color: var(--text); }
 </style>
 </head>
 <body>
@@ -356,6 +443,7 @@ a:hover { text-decoration: underline; }
   </div>
   <div id="controls">
     <label><input type="checkbox" id="think-toggle" checked> Thinking</label>
+    <button id="gear-btn" onclick="openSettings()" title="System prompt settings">⚙</button>
     <button id="clear-btn" onclick="clearChat()">Clear</button>
   </div>
 </div>
@@ -368,6 +456,38 @@ a:hover { text-decoration: underline; }
 </div>
 </div>
 
+<div id="settings-overlay" onclick="if(event.target===this) closeSettings()">
+  <div id="settings-modal">
+    <h2>System Prompt</h2>
+    <textarea id="system-prompt-input" placeholder="Optional custom instructions for the assistant..."></textarea>
+    <div class="hint">
+      Custom text is inserted between date/time and the web-search tool block
+      (whichever of those are enabled below). Leave blank for defaults only.
+    </div>
+    <div class="toggle-row">
+      <label>
+        <input type="checkbox" id="include-datetime" checked>
+        <span>
+          Include current date/time
+          <span class="toggle-desc">Injects “Current date and time: …” at the top of the system prompt.</span>
+        </span>
+      </label>
+      <label>
+        <input type="checkbox" id="include-search" checked>
+        <span>
+          Enable web search tool instructions
+          <span class="toggle-desc">Advertises [[search]] markers and allows the server to run web search. Off = offline-only.</span>
+        </span>
+      </label>
+    </div>
+    <div class="actions">
+      <button class="reset-btn" onclick="resetSystemPrompt()" style="margin-right:auto">Reset</button>
+      <button class="cancel-btn" onclick="closeSettings()">Cancel</button>
+      <button class="save-btn" onclick="saveSystemPrompt()">Save</button>
+    </div>
+  </div>
+</div>
+
 <script>
 const API_URL = '/chat';
 let messages = [];
@@ -375,9 +495,71 @@ let busy = false;
 let conversations = [];      // [{id, title, messages}]
 let activeConvId = null;
 let abortController = null;  // AbortController for the active fetch, if any
+let systemPrompt = '';       // Custom system prompt (localStorage)
+let includeDatetime = true;  // Inject current date/time into system prompt
+let includeSearch = true;    // Include web-search tool instructions + allow tool loop
 
 // ── Conversation persistence ────────────────────────────────────────────────
 const STORAGE_KEY = 'lan-chat-conversations';
+const PROMPT_KEY = 'lan-chat-system-prompt';       // legacy string key (migrated)
+const SETTINGS_KEY = 'lan-chat-settings';          // {system_prompt, include_datetime, include_search}
+
+function loadSystemPrompt() {
+  try {
+    const raw = localStorage.getItem(SETTINGS_KEY);
+    if (raw) {
+      const s = JSON.parse(raw);
+      systemPrompt = s.system_prompt || '';
+      includeDatetime = s.include_datetime !== false;
+      includeSearch = s.include_search !== false;
+      return;
+    }
+    // Migrate legacy plain-string prompt key
+    systemPrompt = localStorage.getItem(PROMPT_KEY) || '';
+    includeDatetime = true;
+    includeSearch = true;
+  } catch {
+    systemPrompt = '';
+    includeDatetime = true;
+    includeSearch = true;
+  }
+}
+
+function persistSettings() {
+  try {
+    localStorage.setItem(SETTINGS_KEY, JSON.stringify({
+      system_prompt: systemPrompt,
+      include_datetime: includeDatetime,
+      include_search: includeSearch,
+    }));
+  } catch {}
+}
+
+function openSettings() {
+  document.getElementById('system-prompt-input').value = systemPrompt;
+  document.getElementById('include-datetime').checked = includeDatetime;
+  document.getElementById('include-search').checked = includeSearch;
+  document.getElementById('settings-overlay').classList.add('open');
+  document.getElementById('system-prompt-input').focus();
+}
+
+function closeSettings() {
+  document.getElementById('settings-overlay').classList.remove('open');
+}
+
+function saveSystemPrompt() {
+  systemPrompt = document.getElementById('system-prompt-input').value;
+  includeDatetime = document.getElementById('include-datetime').checked;
+  includeSearch = document.getElementById('include-search').checked;
+  persistSettings();
+  closeSettings();
+}
+
+function resetSystemPrompt() {
+  document.getElementById('system-prompt-input').value = '';
+  document.getElementById('include-datetime').checked = true;
+  document.getElementById('include-search').checked = true;
+}
 
 function loadConversations() {
   try {
@@ -730,6 +912,9 @@ async function sendMessage() {
       body: JSON.stringify({
         messages: messages,
         thinking: thinking,
+        system_prompt: systemPrompt,
+        include_datetime: includeDatetime,
+        include_search: includeSearch,
       }),
       signal: abortController.signal,
     });
@@ -848,6 +1033,7 @@ function clearChat() {
 }
 
 // ── Initialize on page load ─────────────────────────────────────────────────
+loadSystemPrompt();
 loadConversations();
 renderConvList();
 if (activeConvId) {
@@ -857,6 +1043,10 @@ if (activeConvId) {
 }
 
 document.getElementById('prompt').focus();
+// Escape closes settings modal
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') closeSettings();
+});
 </script>
 </body>
 </html>
