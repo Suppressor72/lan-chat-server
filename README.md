@@ -1,0 +1,88 @@
+# LAN Chat Server
+
+A lightweight chat UI for any OpenAI-compatible LLM API (vLLM, Ollama, etc.) with built-in web search tool use. Pure Python stdlib — no npm, no Docker, no external dependencies.
+
+![Architecture](https://img.shields.io/badge/python-3.10+-blue) ![Dependencies](https://img.shields.io/badge/dependencies-zero-success)
+
+## Features
+
+- **Single-file server** (`server.py`) — serves the chat UI, proxies LLM API calls, and handles web search tool use
+- **Autonomous web search** — the model decides when to search, fetches full page content (not just snippets), and synthesizes answers with citations
+- **Server-Sent Events streaming** — responses stream to the browser as they're generated
+- **Multi-turn conversations** — full conversation history maintained client-side
+- **Thinking mode toggle** — enable/disable model reasoning output
+- **LAN accessible** — any browser on your network can connect
+- **Zero dependencies** — runs on Python stdlib only (http.server, urllib, socketserver)
+
+## How It Works
+
+```
+Browser (chat.html)
+    │
+    │ POST /chat (SSE stream)
+    ▼
+server.py ─── DuckDuckGo Search ─── Page Fetching (parallel)
+    │
+    │ POST /v1/chat/completions
+    ▼
+Your LLM API (vLLM, Ollama, etc.)
+```
+
+The server acts as a middleman between the browser and your LLM. When the model decides it needs current information, it emits a `[[search]]query[[/search]]` marker. The server intercepts this, runs a DuckDuckGo search, fetches the top 5 result pages in parallel, strips them to clean text, and feeds them back to the model as tool results. The model then synthesizes a cited answer from the actual page content.
+
+## Quick Start
+
+### 1. Configure
+
+Edit the top of `server.py`:
+
+```python
+VLLM_BASE = "http://127.0.0.1:8001"   # Your LLM API endpoint
+MODEL = "your-model-name"              # Model name your API serves
+```
+
+### 2. Run
+
+```bash
+python3 server.py
+```
+
+### 3. Open in browser
+
+```
+http://localhost:8080          # Local
+http://<your-lan-ip>:8080      # From another machine on your network
+```
+
+## Web Search Details
+
+The search pipeline:
+
+1. **DuckDuckGo HTML scraping** — no API key required, no rate limits to manage
+2. **Parallel page fetching** — top 5 result pages fetched concurrently (~2-3s total)
+3. **HTML-to-text extraction** — strips scripts, styles, nav, and boilerplate; keeps content
+4. **Truncation** — each page capped at 4,000 chars to fit model context window
+
+Tunable parameters at the top of `server.py`:
+
+```python
+MAX_PAGES_TO_FETCH = 5       # How many result pages to read
+MAX_PAGE_CHARS = 4000        # Max chars per page sent to model
+PAGE_FETCH_TIMEOUT = 8       # Seconds per page fetch
+```
+
+## Requirements
+
+- Python 3.10+
+- Any OpenAI-compatible `/v1/chat/completions` endpoint (vLLM, Ollama, LM Studio, text-generation-webui, etc.)
+
+## Files
+
+| File | Description |
+|------|-------------|
+| `server.py` | HTTP server, search engine, page fetcher, tool-use loop |
+| `chat.html` | Chat UI frontend (dark theme, markdown rendering, tool indicators) |
+
+## License
+
+MIT

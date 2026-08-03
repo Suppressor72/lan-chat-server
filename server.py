@@ -1,0 +1,390 @@
+#!/usr/bin/env python3
+"""Web server: serves the chat UI, proxies API requests to vLLM, and provides
+web search tool-use capability. Serves on port 8080 — accessible from any
+browser on the LAN."""
+import http.server
+import socketserver
+import os
+import json
+import urllib.request
+import urllib.parse
+import urllib.error
+import re
+import threading
+import time
+from html.parser import HTMLParser
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
+
+PORT = 8080
+WEB_DIR = os.path.dirname(os.path.abspath(__file__))
+VLLM_BASE = "http://127.0.0.1:8001"
+MODEL = "ThinkingCap-Qwen3.6-27B-FP8"
+
+# ── Page-fetching config ──────────────────────────────────────────────────────
+MAX_PAGES_TO_FETCH = 5       # how many result pages to read in full
+MAX_PAGE_CHARS = 4000        # truncate each page to this many chars for the model
+PAGE_FETCH_TIMEOUT = 8       # seconds per page fetch
+
+# ── Tool-use system prompt ────────────────────────────────────────────────────
+TOOL_SYSTEM_PROMPT = """You are a helpful AI assistant with web search capability.
+
+## Web Search Tool
+When you need current information, recent events, live data, or anything you cannot verify from your training knowledge, use web search. You decide when to search — be proactive about it.
+
+To search the web, output your search query on a single line wrapped in this exact format:
+[[search]]your search query here[[/search]]
+
+After you output the search marker, the system will run the search and return results. Use those results to answer the user's question.
+
+## When to search
+- Current events, news, or anything time-sensitive
+- Stock prices, sports scores, weather
+- Technical documentation that may have changed
+- Anything where your training data might be outdated
+- When the user explicitly asks for current info
+
+## When NOT to search
+- General knowledge, history, math, coding help
+- Creative writing, analysis of provided text
+- Questions about your own capabilities
+- Simple factual questions you're confident about
+
+Search results will be returned after your search marker. Read them carefully and cite sources when relevant."""
+
+
+def build_system_prompt() -> str:
+    """Build the system prompt with current date/time injected."""
+    now = datetime.now()
+    return f"""Current date and time: {now.strftime("%A, %B %d, %Y at %I:%M %p")} ({now.tzname() or "local time"})
+
+{TOOL_SYSTEM_PROMPT}"""
+
+# ── DuckDuckGo search (no API key) ────────────────────────────────────────────
+def search_web(query: str, num_results: int = 5) -> list[dict]:
+    """Search DuckDuckGo and return results as [{title, url, snippet}]."""
+    results = []
+    try:
+        url = f"https://html.duckduckgo.com/html/?q={urllib.parse.quote(query)}"
+        req = urllib.request.Request(url, headers={
+            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept-Language": "en-US,en;q=0.9",
+        })
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            html = resp.read().decode("utf-8", errors="replace")
+
+        # Parse DuckDuckGo HTML results.
+        # DDG markup changes frequently — use a robust approach that handles
+        # attributes in any order (rel="nofollow" may precede class=).
+        # Result blocks: <a ... class="result__a" ... href="...">Title</a>
+        #                 <a ... class="result__snippet" ...>Snippet</a>
+        link_pattern = re.compile(
+            r'<a\s+[^>]*class="result__a"[^>]*>(.*?)</a>', re.DOTALL
+        )
+        snippet_pattern = re.compile(
+            r'<a\s+[^>]*class="result__snippet"[^>]*>(.*?)</a>', re.DOTALL
+        )
+        href_pattern = re.compile(r'href="([^"]*)"')
+
+        # Find all result links, then grab the next snippet after each
+        link_iter = list(link_pattern.finditer(html))
+        snippet_iter = list(snippet_pattern.finditer(html))
+
+        for i, link_match in enumerate(link_iter):
+            link_html = link_match.group(0)
+            title = re.sub(r"<[^>]+>", "", link_match.group(1)).strip()
+
+            # Extract real URL from DDG redirect (href may contain uddg= param)
+            href_match = href_pattern.search(link_html)
+            real_url = ""
+            if href_match:
+                raw_href = href_match.group(1)
+                uddg = re.search(r"uddg=([^&\"]*)", raw_href)
+                if uddg:
+                    real_url = urllib.parse.unquote(uddg.group(1))
+
+            # Match snippet — the closest one after this link
+            snippet = ""
+            for sm in snippet_iter:
+                if sm.start() > link_match.start():
+                    snippet = re.sub(r"<[^>]+>", "", sm.group(1)).strip()
+                    break
+
+            results.append({"title": title, "url": real_url, "snippet": snippet})
+            if len(results) >= num_results:
+                break
+    except Exception as e:
+        results = [{"title": "Search error", "url": "", "snippet": str(e)}]
+
+    return results if results else [{"title": "No results", "url": "", "snippet": f"No results found for: {query}"}]
+
+
+def format_search_results(results: list[dict]) -> str:
+    """Format search results into a readable string for the model."""
+    lines = ["Web search results:"]
+    for i, r in enumerate(results, 1):
+        lines.append(f"  [{i}] {r['title']}")
+        lines.append(f"      {r['url']}")
+        lines.append(f"      {r['snippet']}")
+    return "\n".join(lines)
+
+
+# ── HTML-to-text conversion ───────────────────────────────────────────────────
+class _HTMLTextExtractor(HTMLParser):
+    """Minimal HTML→text: extracts visible text, skips script/style/nav noise."""
+    _SKIP_TAGS = {"script", "style", "noscript", "svg", "head", "nav", "footer", "aside"}
+    _BLOCK_TAGS = {"p", "div", "br", "li", "h1", "h2", "h3", "h4", "h5", "h6", "tr", "td", "th"}
+
+    def __init__(self):
+        super().__init__()
+        self._parts = []
+        self._skip_depth = 0
+
+    def handle_starttag(self, tag, attrs):
+        if tag in self._SKIP_TAGS:
+            self._skip_depth += 1
+        if tag in self._BLOCK_TAGS and self._parts:
+            self._parts.append("\n")
+
+    def handle_endtag(self, tag):
+        if tag in self._SKIP_TAGS and self._skip_depth > 0:
+            self._skip_depth -= 1
+        if tag in self._BLOCK_TAGS:
+            self._parts.append("\n")
+
+    def handle_data(self, data):
+        if self._skip_depth == 0:
+            self._parts.append(data)
+
+    def get_text(self):
+        raw = "".join(self._parts)
+        # Collapse whitespace within lines, keep paragraph breaks
+        lines = [re.sub(r"[ \t]+", " ", ln).strip() for ln in raw.split("\n")]
+        # Remove empty lines
+        lines = [ln for ln in lines if ln]
+        return "\n".join(lines)
+
+
+def html_to_text(html: str) -> str:
+    """Convert HTML page to clean readable text."""
+    parser = _HTMLTextExtractor()
+    parser.feed(html)
+    return parser.get_text()
+
+
+# ── Page fetching ─────────────────────────────────────────────────────────────
+def fetch_page_content(url: str, timeout: int = PAGE_FETCH_TIMEOUT) -> str:
+    """Fetch a URL and return cleaned text content. Returns empty string on failure."""
+    try:
+        req = urllib.request.Request(url, headers={
+            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+        })
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            content_type = resp.headers.get("Content-Type", "")
+            # Skip non-HTML (PDFs, images, binaries)
+            if "text/html" not in content_type and "text/plain" not in content_type:
+                return ""
+            raw = resp.read(2_000_000)  # 2MB cap to avoid massive pages
+            charset = resp.headers.get_content_charset() or "utf-8"
+            html = raw.decode(charset, errors="replace")
+
+        text = html_to_text(html)
+        if len(text) > MAX_PAGE_CHARS:
+            text = text[:MAX_PAGE_CHARS] + "\n...[truncated]"
+        return text
+    except Exception:
+        return ""
+
+
+def fetch_pages_parallel(results: list[dict], max_pages: int = MAX_PAGES_TO_FETCH) -> dict:
+    """Fetch multiple pages concurrently. Returns {url: page_text}."""
+    pages = {}
+    to_fetch = [r for r in results[:max_pages] if r.get("url")]
+    if not to_fetch:
+        return pages
+
+    with ThreadPoolExecutor(max_workers=len(to_fetch)) as pool:
+        future_to_url = {
+            pool.submit(fetch_page_content, r["url"]): r["url"]
+            for r in to_fetch
+        }
+        for future in as_completed(future_to_url, timeout=PAGE_FETCH_TIMEOUT + 2):
+            url = future_to_url[future]
+            try:
+                text = future.result(timeout=PAGE_FETCH_TIMEOUT + 2)
+                if text:
+                    pages[url] = text
+            except Exception:
+                pass
+    return pages
+
+
+def format_search_results_with_pages(results: list[dict], pages: dict) -> str:
+    """Format snippets + full page content for the model."""
+    lines = ["Web search results (with page content):"]
+    for i, r in enumerate(results, 1):
+        lines.append(f"\n--- Result {i}: {r['title']} ---")
+        lines.append(f"URL: {r['url']}")
+        lines.append(f"Snippet: {r['snippet']}")
+        page_text = pages.get(r["url"])
+        if page_text:
+            lines.append(f"Page content ({len(page_text)} chars):")
+            lines.append(page_text)
+        else:
+            lines.append("Page content: [not available]")
+    return "\n".join(lines)
+
+
+# ── vLLM helpers ──────────────────────────────────────────────────────────────
+def vllm_complete(messages: list[dict], thinking: bool = True) -> str:
+    """Send a non-streaming completion to vLLM. Returns the full content."""
+    payload = json.dumps({
+        "model": MODEL,
+        "messages": messages,
+        "max_tokens": 8192,
+        "temperature": 0.7,
+        "top_p": 0.95,
+        "chat_template_kwargs": {"enable_thinking": thinking},
+    }).encode()
+    req = urllib.request.Request(
+        f"{VLLM_BASE}/v1/chat/completions",
+        data=payload,
+        headers={"Content-Type": "application/json", "Authorization": "Bearer EMPTY"},
+    )
+    with urllib.request.urlopen(req, timeout=120) as resp:
+        data = json.loads(resp.read())
+    return data["choices"][0]["message"].get("content", "")
+
+
+# ── Chat handler with tool-use loop ──────────────────────────────────────────
+def run_chat(messages: list[dict], thinking: bool, callback):
+    """Run the chat loop with tool use. Sends SSE events via callback(data_str)."""
+    full_messages = [{"role": "system", "content": build_system_prompt()}] + messages
+
+    # Maximum tool iterations to prevent infinite loops
+    for iteration in range(5):
+        # Get model response
+        content = vllm_complete(full_messages, thinking)
+
+        # Check for tool call markers
+        # Primary: properly closed tags [[search]]query[[/search]]
+        search_match = re.search(r"\[\[search\]\](.+?)\[\[/search\]\]", content, re.DOTALL)
+        # Fallback: model forgot closing tag — grab everything after [[search]]
+        if not search_match:
+            search_match = re.search(r"\[\[search\]\](.+)", content, re.DOTALL)
+        if search_match:
+            query = search_match.group(1).strip()
+            # Send everything before the tool call — strip any leftover markers
+            before = re.sub(r"\[\[/?search\]\]", "", content[:search_match.start()]).strip()
+            if before:
+                callback(json.dumps({"type": "content", "text": before}))
+
+            # Notify client that a tool call is happening
+            callback(json.dumps({"type": "tool_call", "tool": "web_search", "query": query}))
+
+            # Run the search
+            results = search_web(query)
+
+            # Fetch full page content in parallel (top N results)
+            pages = fetch_pages_parallel(results)
+            result_text = format_search_results_with_pages(results, pages)
+
+            # Notify client of results
+            callback(json.dumps({"type": "tool_result", "tool": "web_search", "results": result_text, "pages_fetched": len(pages)}))
+
+            # Add assistant response (stripped of markers) and tool result
+            response_clean = re.sub(r"\[\[/?search\]\]", "", content).strip()
+            full_messages.append({"role": "assistant", "content": response_clean})
+            full_messages.append({"role": "tool", "content": result_text})
+
+            # Continue the loop — model sees the results and generates a proper answer
+            continue
+
+        # No tool call — this is the final answer
+        callback(json.dumps({"type": "content", "text": content}))
+        full_messages.append({"role": "assistant", "content": content})
+        callback(json.dumps({"type": "done"}))
+        return
+
+    # If we hit max iterations, return what we have
+    callback(json.dumps({"type": "content", "text": "\n[Search iterations exceeded maximum. Based on available results...]"}) )
+    callback(json.dumps({"type": "done"}))
+
+
+# ── HTTP handlers ─────────────────────────────────────────────────────────────
+class ChatHandler(http.server.SimpleHTTPRequestHandler):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, directory=WEB_DIR, **kwargs)
+
+    def end_headers(self):
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
+        self.send_header('Access-Control-Allow-Headers', 'Content-Type')
+        super().end_headers()
+
+    def do_OPTIONS(self):
+        self.send_response(200)
+        self.end_headers()
+
+    def do_GET(self):
+        if self.path == '/' or self.path == '/index.html':
+            self.path = '/chat.html'
+        return super().do_GET()
+
+    def do_POST(self):
+        if self.path == '/chat':
+            self._handle_chat()
+        elif self.path == '/search':
+            self._handle_search()
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def _handle_search(self):
+        """Standalone search endpoint for direct use."""
+        length = int(self.headers.get('Content-Length', 0))
+        body = json.loads(self.rfile.read(length)) if length else {}
+        query = body.get("query", "")
+        results = search_web(query)
+        self.send_response(200)
+        self.send_header('Content-Type', 'application/json')
+        self.end_headers()
+        self.wfile.write(json.dumps(results).encode())
+
+    def _handle_chat(self):
+        """Handle chat with tool-use loop. Uses SSE for streaming events."""
+        length = int(self.headers.get('Content-Length', 0))
+        body = json.loads(self.rfile.read(length)) if length else {}
+        messages = body.get("messages", [])
+        thinking = body.get("thinking", True)
+
+        self.send_response(200)
+        self.send_header('Content-Type', 'text/event-stream')
+        self.send_header('Cache-Control', 'no-cache')
+        self.send_header('Connection', 'close')
+        self.close_connection = True  # ensure socket closes after SSE response
+        self.end_headers()
+
+        def callback(data):
+            try:
+                self.wfile.write(f"data: {data}\n\n".encode())
+                self.wfile.flush()
+            except Exception:
+                pass  # Client disconnected
+
+        run_chat(messages, thinking, callback)
+
+
+if __name__ == '__main__':
+    # Threaded server — allows concurrent requests (page load while a
+    # multi-round /chat is running, multiple users, etc.)
+    socketserver.ThreadingTCPServer.allow_reuse_address = True
+    with socketserver.ThreadingTCPServer(("0.0.0.0", PORT), ChatHandler) as httpd:
+        httpd.daemon_threads = True
+        print(f"Chat UI serving on http://0.0.0.0:{PORT} (threaded)")
+        print(f"Access from LAN: http://<your-ip>:{PORT}")
+        print(f"vLLM API at {VLLM_BASE}")
+        print(f"Web search enabled (DuckDuckGo)")
+        httpd.serve_forever()
