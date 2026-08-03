@@ -301,8 +301,37 @@ body {
   30% { opacity: 1; transform: scale(1.2); }
 }
 code { background: rgba(255,255,255,0.08); padding: 2px 6px; border-radius: 4px; font-size: 13px; }
-pre { background: rgba(0,0,0,0.3); padding: 12px; border-radius: 8px; overflow-x: auto; margin: 8px 0; }
+pre { background: rgba(0,0,0,0.3); padding: 12px; border-radius: 8px; overflow-x: auto; margin: 8px 0; position: relative; }
 pre code { background: none; padding: 0; }
+pre .code-copy-btn {
+  position: absolute;
+  top: 6px; right: 6px;
+  background: rgba(255,255,255,0.08);
+  color: var(--text-dim);
+  border: 1px solid rgba(255,255,255,0.1);
+  border-radius: 4px;
+  padding: 2px 8px;
+  font-size: 11px;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.15s;
+}
+pre:hover .code-copy-btn { opacity: 1; }
+pre .code-copy-btn:hover { background: rgba(255,255,255,0.15); color: var(--text); }
+pre .code-copy-btn.copied { background: #2d5a3d; color: #4ade80; opacity: 1; }
+.msg-copy-btn {
+  background: none;
+  border: none;
+  color: var(--text-dim);
+  cursor: pointer;
+  font-size: 12px;
+  opacity: 0;
+  transition: opacity 0.15s;
+  padding: 0 4px;
+}
+.msg:hover .msg-copy-btn { opacity: 0.5; }
+.msg-copy-btn:hover { opacity: 1 !important; }
+.msg-copy-btn.copied { opacity: 1 !important; color: #4ade80; }
 a { color: #60a5fa; text-decoration: none; }
 a:hover { text-decoration: underline; }
 </style>
@@ -517,6 +546,60 @@ function formatContent(text) {
   return html;
 }
 
+function copyToClipboard(text, btn) {
+  // navigator.clipboard only works in secure contexts (HTTPS or localhost).
+  // On a LAN HTTP connection, fall back to the legacy execCommand approach.
+  const success = () => {
+    if (btn) {
+      const original = btn.textContent;
+      btn.textContent = '✓';
+      btn.classList.add('copied');
+      setTimeout(() => {
+        btn.textContent = original;
+        btn.classList.remove('copied');
+      }, 1500);
+    }
+  };
+
+  if (navigator.clipboard && window.isSecureContext) {
+    navigator.clipboard.writeText(text).then(success).catch(() => {
+      _copyFallback(text);
+      success();
+    });
+  } else {
+    _copyFallback(text);
+    success();
+  }
+}
+
+function _copyFallback(text) {
+  const ta = document.createElement('textarea');
+  ta.value = text;
+  ta.style.position = 'fixed';
+  ta.style.left = '-9999px';
+  document.body.appendChild(ta);
+  ta.select();
+  try { document.execCommand('copy'); } catch (e) {}
+  document.body.removeChild(ta);
+}
+
+function enhanceCodeBlocks(container) {
+  // Add copy buttons to all <pre> blocks that don't have one yet
+  const pres = container.querySelectorAll('pre');
+  for (const pre of pres) {
+    if (pre.querySelector('.code-copy-btn')) continue;
+    const btn = document.createElement('button');
+    btn.className = 'code-copy-btn';
+    btn.textContent = 'Copy';
+    btn.onclick = (e) => {
+      e.stopPropagation();
+      const code = pre.querySelector('code');
+      copyToClipboard(code ? code.textContent : pre.textContent, btn);
+    };
+    pre.appendChild(btn);
+  }
+}
+
 function addMsg(role, content) {
   const chat = document.getElementById('chat');
   const div = document.createElement('div');
@@ -531,6 +614,14 @@ function addMsg(role, content) {
   } else {
     body.innerHTML = formatContent(content);
   }
+  enhanceCodeBlocks(body);
+  // Message-level copy button — reads body.textContent at click time,
+  // so it captures the final rendered text even after streaming replaces it
+  const copyBtn = document.createElement('button');
+  copyBtn.className = 'msg-copy-btn';
+  copyBtn.textContent = '📋';
+  copyBtn.onclick = () => copyToClipboard(body.textContent, copyBtn);
+  tag.appendChild(copyBtn);
   div.appendChild(tag);
   div.appendChild(body);
   chat.appendChild(div);
@@ -666,6 +757,7 @@ async function sendMessage() {
           if (event.type === 'content') {
             contentText += event.text;
             assistantBody.innerHTML = formatContent(contentText);
+            enhanceCodeBlocks(assistantBody);
             document.getElementById('chat').scrollTop = document.getElementById('chat').scrollHeight;
           }
           else if (event.type === 'tool_call') {
@@ -735,6 +827,7 @@ async function sendMessage() {
       // User clicked Stop — save whatever partial content we have
       if (contentText && contentText.trim()) {
         assistantBody.innerHTML = formatContent(contentText);
+        enhanceCodeBlocks(assistantBody);
         messages.push({ role: 'assistant', content: contentText });
         updateActiveConvMessages();
       } else if (assistantBody) {
