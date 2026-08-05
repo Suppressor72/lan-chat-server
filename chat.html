@@ -158,6 +158,29 @@ body {
   text-transform: uppercase;
   letter-spacing: 0.5px;
 }
+/* Markdown tables — size to content, not full chat width */
+.msg table {
+  border-collapse: collapse;
+  width: max-content;
+  max-width: 100%;
+  margin: 8px 0;
+  font-size: 13px;
+  white-space: normal;
+  table-layout: auto;
+}
+.msg th, .msg td {
+  border: 1px solid rgba(255,255,255,0.12);
+  padding: 5px 10px;
+  text-align: left;
+  vertical-align: middle;
+}
+.msg th {
+  background: rgba(255,255,255,0.06);
+  font-weight: 600;
+}
+.msg tr:nth-child(even) td {
+  background: rgba(255,255,255,0.02);
+}
 /* Tool call indicators */
 .tool-indicator {
   align-self: center;
@@ -719,12 +742,43 @@ function formatContent(text) {
   html = html.replace(/(https?:\/\/[^\s<]+)/g, '<a href="$1" target="_blank" rel="noopener">$1</a>');
   // Code blocks
   html = html.replace(/```(\w*)\n?([\s\S]*?)```/g, (m, lang, code) => {
-    return '<pre><code>' + code.trim() + '</code></pre>';
+    return '\n\n<pre><code>' + code.trim() + '\n</code></pre>\n\n';
   });
   // Inline code
   html = html.replace(/`([^`]+)`/g, '<code>$1</code>');
   // Bold
   html = html.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
+  // Markdown tables (GFM)
+  html = html.replace(/^(\|.+\|)\n(\|[\s:|-]+\|)\n((?:\|.+\|\n?)+)/gm, (m, headerRow, sepRow, bodyRows) => {
+    const parseCells = (row) => {
+      return row.trim().replace(/^\||\|$/g, '').split('|').map(c => c.trim());
+    };
+    const headers = parseCells(headerRow);
+    // Parse alignment from separator row
+    const seps = parseCells(sepRow);
+    const aligns = seps.map(s => {
+      if (s.startsWith(':') && s.endsWith(':')) return 'center';
+      if (s.endsWith(':')) return 'right';
+      return 'left';
+    });
+    let table = '<table><thead><tr>';
+    headers.forEach((h, i) => {
+      table += `<th style="text-align:${aligns[i] || 'left'}">${h}</th>`;
+    });
+    table += '</tr></thead><tbody>';
+    bodyRows.trim().split('\n').forEach(row => {
+      row = row.trim();
+      if (!row) return;
+      const cells = parseCells(row);
+      table += '<tr>';
+      headers.forEach((_, i) => {
+        table += `<td style="text-align:${aligns[i] || 'left'}">${cells[i] || ''}</td>`;
+      });
+      table += '</tr>';
+    });
+    table += '</tbody></table>';
+    return table;
+  });
   return html;
 }
 
