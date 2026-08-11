@@ -6,11 +6,19 @@ A lightweight chat UI for any OpenAI-compatible LLM API (vLLM, Ollama, etc.) wit
 
 ## Features
 
-- **Single-file server** (`server.py`) — serves the chat UI, proxies LLM API calls, and handles web search tool use
+- **Single-file server** (`server.py`) — serves the chat UI, proxies LLM API calls, handles web search tool use, and detects client disconnects during streaming
 - **Autonomous web search** — the model decides when to search, fetches full page content (not just snippets), and synthesizes answers with citations
 - **Server-Sent Events streaming** — responses stream to the browser as they're generated
-- **Multi-turn conversations** — full conversation history maintained client-side
+- **Multi-turn conversations** — full conversation history saved in `localStorage`, survives page reloads
+- **Reasoning token streaming** — live thinking/reasoning tokens render in a collapsible block during generation, auto-collapse when content begins, persisted with conversation history
+- **Per-phase token stats** — thinking t/s, content t/s, and total t/s displayed below each assistant message, using vLLM's `usage` chunk for accurate token counts (not chunk counting)
+- **Model selection dropdown** — populated from the swap proxy `/v1/models` endpoint; switch models on the fly with localStorage persistence. Supports hot-swap backends via systemd
+- **Live health indicators** — three status dots (Server / Proxy / vLLM) poll a `/health` endpoint every 10 seconds and show the currently loaded model name
+- **Stop generation** — `AbortController` cancels the fetch mid-stream; server detects client disconnect via socket probe and stops generating. Partial content is saved
 - **Thinking mode toggle** — enable/disable model reasoning output
+- **Conversation sidebar** — create, switch between, and delete conversations; auto-titled from first message
+- **Markdown rendering** — links, bold, inline/block code with copy buttons, GFM tables (dark-themed, content-width)
+- **System prompt customization** — gear icon opens settings for custom system prompt, date/time injection, and web search toggle
 - **LAN accessible** — any browser on your network can connect
 - **Zero dependencies** — runs on Python stdlib only (http.server, urllib, socketserver)
 
@@ -19,16 +27,21 @@ A lightweight chat UI for any OpenAI-compatible LLM API (vLLM, Ollama, etc.) wit
 ```
 Browser (chat.html)
     │
-    │ POST /chat (SSE stream)
+    │ POST /chat (SSE stream)  ·  GET /models  ·  GET /health
     ▼
 server.py ─── DuckDuckGo Search ─── Page Fetching (parallel)
     │
-    │ POST /v1/chat/completions
+    │ POST /v1/chat/completions  ·  GET /v1/models
     ▼
-Your LLM API (vLLM, Ollama, etc.)
+Swap Proxy (:8001) ─── routes to correct backend, hot-swaps via systemd
+    │
+    ├──▶ vLLM Backend A (:8002)
+    └──▶ vLLM Backend B (:8003)
 ```
 
 The server acts as a middleman between the browser and your LLM. When the model decides it needs current information, it emits a `[[search]]query[[/search]]` marker. The server intercepts this, runs a DuckDuckGo search, fetches the top 5 result pages in parallel, strips them to clean text, and feeds them back to the model as tool results. The model then synthesizes a cited answer from the actual page content.
+
+When used with a swap proxy (any OpenAI-compatible reverse proxy), the chat server's `/models` endpoint discovers available backends and the dropdown lets you switch between them. The swap proxy handles stopping the current backend and starting the requested one. The `/health` endpoint checks proxy reachability and reports which model is currently loaded.
 
 ## Quick Start
 
@@ -80,8 +93,8 @@ PAGE_FETCH_TIMEOUT = 8       # Seconds per page fetch
 
 | File | Description |
 |------|-------------|
-| `server.py` | HTTP server, search engine, page fetcher, tool-use loop |
-| `chat.html` | Chat UI frontend (dark theme, markdown rendering, tool indicators) |
+| `server.py` | HTTP server, search engine, page fetcher, tool-use loop, health/proxy endpoints, disconnect detection |
+| `chat.html` | Chat UI frontend (dark theme, reasoning UI, markdown, token stats, model selector, health indicators, sidebar) |
 
 ## License
 
