@@ -3,15 +3,15 @@
 web search tool-use capability. Serves on port 8080 — accessible from any
 browser on the LAN."""
 import http.server
+import socket
 import socketserver
 import os
 import json
+import time
 import urllib.request
 import urllib.parse
 import urllib.error
 import re
-import threading
-import time
 from html.parser import HTMLParser
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
@@ -261,19 +261,21 @@ def format_search_results_with_pages(results: list[dict], pages: dict) -> str:
 
 
 # ── vLLM helpers ──────────────────────────────────────────────────────────────
-def vllm_stream(messages: list[dict], thinking: bool = True):
-    """Stream a completion from vLLM, yielding content chunks as they arrive.
+def vllm_stream(messages: list[dict], thinking: bool = True, model: str | None = None):
+    """Stream a completion from vLLM, yielding content/reasoning chunks.
 
     Yields:
-        str — each chunk of content text from the model.
+        tuple(str, str|dict) — (chunk_type, data) where chunk_type is
+        'content', 'reasoning', or 'usage' (data is dict for usage).
     """
     payload = json.dumps({
-        "model": MODEL,
+        "model": model or MODEL,
         "messages": messages,
         "max_tokens": 8192,
         "temperature": 0.7,
         "top_p": 0.95,
         "stream": True,
+        "stream_options": {"include_usage": True},
         "chat_template_kwargs": {"enable_thinking": thinking},
     }).encode()
     req = urllib.request.Request(
@@ -282,7 +284,6 @@ def vllm_stream(messages: list[dict], thinking: bool = True):
         headers={"Content-Type": "application/json", "Authorization": "Bearer EMPTY"},
     )
     with urllib.request.urlopen(req, timeout=120) as resp:
-        buffer = ""
         for raw_line in resp:
             line = raw_line.decode("utf-8", errors="replace")
             if not line.startswith("data: "):
@@ -292,10 +293,17 @@ def vllm_stream(messages: list[dict], thinking: bool = True):
                 break
             try:
                 chunk = json.loads(data)
+                # Usage chunk (last chunk when include_usage=True)
+                if "usage" in chunk and chunk.get("usage"):
+                    yield ("usage", chunk["usage"])
+                    continue
                 delta = chunk["choices"][0].get("delta", {})
                 content_piece = delta.get("content")
+                reasoning_piece = delta.get("reasoning") or delta.get("reasoning_content")
+                if reasoning_piece:
+                    yield ("reasoning", reasoning_piece)
                 if content_piece:
-                    yield content_piece
+                    yield ("content", content_piece)
             except (json.JSONDecodeError, KeyError, IndexError):
                 continue
 
@@ -313,6 +321,7 @@ def run_chat(
     system_prompt: str = "",
     include_datetime: bool = True,
     include_search: bool = True,
+    model: str | None = None,
 ):
     """Run the chat loop with optional tool use. Sends SSE events via callback(data_str).
 
@@ -325,14 +334,58 @@ def run_chat(
         "content": build_system_prompt(system_prompt, include_datetime, include_search),
     }] + messages
 
+    # Token timing accumulators
+    total_content_tokens = 0
+    total_thinking_tokens = 0
+    total_thinking_time = 0.0
+    total_content_time = 0.0
+
     for iteration in range(5):
         content = ""
+        reasoning = ""
         sent_len = 0
         search_detected = False
         started = False
+        iter_content_tokens = 0
+        iter_thinking_tokens = 0
 
-        for token in vllm_stream(full_messages, thinking):
-            content += token
+        # Per-phase timing: starts on FIRST token (excludes TTFT/prefill)
+        phase_start = None  # set on first token arrival
+        last_phase = None
+
+        for chunk_type, token in vllm_stream(full_messages, thinking, model=model):
+            # Capture usage data (vLLM sends it in the final chunk)
+            if chunk_type == "usage":
+                u = token  # token is actually a dict here
+                iter_content_tokens = u.get("completion_tokens", iter_content_tokens)
+                # vLLM may report reasoning tokens separately in usage
+                iter_thinking_tokens = u.get("reasoning_tokens", 0)
+                if iter_thinking_tokens:
+                    iter_content_tokens = max(0, iter_content_tokens - iter_thinking_tokens)
+                continue
+
+            # Start timer on first actual token (excludes prefill/TTFT)
+            now = time.monotonic()
+            if phase_start is None:
+                phase_start = now
+                last_phase = chunk_type
+
+            # Track phase transitions for accurate per-phase timing
+            if chunk_type != last_phase:
+                if last_phase == "reasoning":
+                    total_thinking_time += now - phase_start
+                elif last_phase == "content":
+                    total_content_time += now - phase_start
+                phase_start = now
+                last_phase = chunk_type
+
+            if chunk_type == "reasoning":
+                reasoning += token
+                if not callback(json.dumps({"type": "reasoning", "text": token})):
+                    return  # client disconnected — abort
+                continue
+            else:
+                content += token
 
             # Check if client is still connected
             if not callback(""):
@@ -402,6 +455,35 @@ def run_chat(
         if len(content_clean) > sent_len:
             callback(json.dumps({"type": "content", "text": content_clean[sent_len:]}))
         full_messages.append({"role": "assistant", "content": content_clean.strip()})
+
+        # Close out the final phase timing
+        now = time.monotonic()
+        if phase_start is not None:
+            if last_phase == "reasoning":
+                total_thinking_time += now - phase_start
+            elif last_phase == "content":
+                total_content_time += now - phase_start
+
+        # Accumulate token counts
+        total_content_tokens += iter_content_tokens
+        total_thinking_tokens += iter_thinking_tokens
+
+        # Calculate per-phase rates using phase-specific denominators
+        total_gen_time = total_thinking_time + total_content_time
+        content_tps = total_content_tokens / total_content_time if total_content_time > 0 else 0
+        thinking_tps = total_thinking_tokens / total_thinking_time if total_thinking_time > 0 else 0
+        total_tps = (total_content_tokens + total_thinking_tokens) / total_gen_time if total_gen_time > 0 else 0
+        callback(json.dumps({
+            "type": "stats",
+            "content_tokens": total_content_tokens,
+            "thinking_tokens": total_thinking_tokens,
+            "content_tps": round(content_tps, 1),
+            "thinking_tps": round(thinking_tps, 1),
+            "total_tps": round(total_tps, 1),
+            "thinking_time_s": round(total_thinking_time, 1),
+            "content_time_s": round(total_content_time, 1),
+            "gen_time_s": round(total_gen_time, 1),
+        }))
         callback(json.dumps({"type": "done"}))
         return
 
@@ -429,6 +511,12 @@ class ChatHandler(http.server.SimpleHTTPRequestHandler):
     def do_GET(self):
         if self.path == '/' or self.path == '/index.html':
             self.path = '/chat.html'
+        elif self.path == '/models':
+            self._proxy_get('/v1/models')
+            return
+        elif self.path == '/health':
+            self._handle_health()
+            return
         return super().do_GET()
 
     def do_POST(self):
@@ -436,9 +524,72 @@ class ChatHandler(http.server.SimpleHTTPRequestHandler):
             self._handle_chat()
         elif self.path == '/search':
             self._handle_search()
+        elif self.path == '/refresh':
+            self._proxy_post('/refresh')
         else:
             self.send_response(404)
             self.end_headers()
+
+    def _handle_health(self):
+        """Check proxy and vLLM backend health, return JSON status."""
+        result = {"server": True, "proxy": False, "vllm": False,
+                  "loaded_model": None}
+        # Check swap proxy
+        try:
+            req = urllib.request.Request(f"{VLLM_BASE}/v1/models")
+            with urllib.request.urlopen(req, timeout=3) as resp:
+                result["proxy"] = True
+                data = json.loads(resp.read())
+                # Find loaded model
+                for m in data.get("data", []):
+                    if m.get("owned_by") == "local":
+                        result["vllm"] = True
+                        result["loaded_model"] = m.get("id")
+                        break
+        except Exception:
+            pass
+        self.send_response(200)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Cache-Control', 'no-cache')
+        self.end_headers()
+        self.wfile.write(json.dumps(result).encode())
+
+    def _proxy_get(self, backend_path):
+        """Proxy a GET request to vLLM swap proxy."""
+        try:
+            req = urllib.request.Request(f"{VLLM_BASE}{backend_path}")
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                self.send_response(resp.status)
+                self.send_header('Content-Type', 'application/json')
+                self.end_headers()
+                self.wfile.write(resp.read())
+        except Exception as e:
+            self.send_response(502)
+            self.send_header('Content-Type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps({"error": str(e)}).encode())
+
+    def _proxy_post(self, backend_path):
+        """Proxy a POST request to vLLM swap proxy."""
+        length = int(self.headers.get('Content-Length', 0))
+        body = self.rfile.read(length) if length else b''
+        try:
+            req = urllib.request.Request(
+                f"{VLLM_BASE}{backend_path}",
+                data=body,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                self.send_response(resp.status)
+                self.send_header('Content-Type', 'application/json')
+                self.end_headers()
+                self.wfile.write(resp.read())
+        except Exception as e:
+            self.send_response(502)
+            self.send_header('Content-Type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps({"error": str(e)}).encode())
 
     def _handle_search(self):
         """Standalone search endpoint for direct use."""
@@ -460,6 +611,7 @@ class ChatHandler(http.server.SimpleHTTPRequestHandler):
         system_prompt = body.get("system_prompt", "")
         include_datetime = body.get("include_datetime", True)
         include_search = body.get("include_search", True)
+        model = body.get("model", None)
 
         self.send_response(200)
         self.send_header('Content-Type', 'text/event-stream')
@@ -477,12 +629,31 @@ class ChatHandler(http.server.SimpleHTTPRequestHandler):
                     self.wfile.flush()
                 except Exception:
                     client_connected[0] = False
+            else:
+                # Connection check: probe if the client socket is still open
+                try:
+                    # Non-blocking recv — if it returns empty bytes, the client
+                    # has disconnected. If it raises BlockingIOError, the socket
+                    # is still open (no data available to read).
+                    sock = self.connection
+                    sock.setblocking(False)
+                    try:
+                        data = sock.recv(1, socket.MSG_PEEK)
+                        if not data:
+                            client_connected[0] = False
+                    except (BlockingIOError, InterruptedError):
+                        pass  # socket is still open, no data to read
+                    finally:
+                        sock.setblocking(True)
+                except Exception:
+                    client_connected[0] = False
             return client_connected[0]
 
         run_chat(
             messages, thinking, callback, system_prompt,
             include_datetime=bool(include_datetime),
             include_search=bool(include_search),
+            model=model,
         )
 
 

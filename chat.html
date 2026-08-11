@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Qwen3.6-27B Chat</title>
+<title>LAN Chat</title>
 <style>
 :root {
   --bg: #1a1a2e;
@@ -120,8 +120,32 @@ body {
   border-radius: 50%;
   background: #444;
   margin-right: 6px;
+  transition: background 0.3s;
 }
 #status-dot.online { background: #4ade80; }
+#status-dot.offline { background: #f87171; }
+.status-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 11px;
+  color: var(--text-dim);
+  flex-wrap: wrap;
+}
+.status-item {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+.status-item .dot {
+  display: inline-block;
+  width: 7px; height: 7px;
+  border-radius: 50%;
+  background: #444;
+  transition: background 0.3s;
+}
+.status-item .dot.up { background: #4ade80; }
+.status-item .dot.down { background: #f87171; }
 #chat {
   flex: 1;
   overflow-y: auto;
@@ -136,8 +160,10 @@ body {
   border-radius: var(--radius);
   line-height: 1.6;
   font-size: 14px;
-  white-space: pre-wrap;
   word-wrap: break-word;
+}
+.msg-content {
+  white-space: pre-wrap;
 }
 .msg.user {
   background: var(--user-bg);
@@ -240,6 +266,47 @@ body {
   font-size: 12px;
 }
 /* Spinner */
+.thinking-block {
+  margin: 0 0 8px;
+  border: 1px solid rgba(255,255,255,0.08);
+  border-radius: 8px;
+  background: rgba(0,0,0,0.25);
+  overflow: hidden;
+}
+.thinking-block > summary {
+  list-style: none;
+}
+.thinking-block > summary::-webkit-details-marker {
+  display: none;
+}
+.thinking-summary {
+  padding: 6px 12px;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text-dim);
+  cursor: pointer;
+  user-select: none;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  transition: background 0.15s, color 0.15s;
+}
+.thinking-summary:hover {
+  background: rgba(255,255,255,0.04);
+  color: var(--text);
+}
+.thinking-content {
+  padding: 10px 12px;
+  font-size: 12px;
+  line-height: 1.5;
+  color: #a0a0b0;
+  border-top: 1px solid rgba(255,255,255,0.05);
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 250px;
+  overflow-y: auto;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}
 .spinner {
   display: inline-block;
   width: 14px;
@@ -299,6 +366,35 @@ body {
 }
 #controls label { color: var(--text-dim); display: flex; align-items: center; gap: 4px; }
 #controls input[type="checkbox"] { accent-color: var(--accent); }
+
+/* Model selector dropdown */
+#model-select {
+  background: var(--bg-input);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 4px 8px;
+  font-size: 12px;
+  cursor: pointer;
+  outline: none;
+}
+#model-select option {
+  background: #1a1a1a;
+  color: #e0e0e0;
+  padding: 6px;
+}
+#model-select:focus { border-color: var(--accent); }
+
+#model-refresh-btn {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--text-dim);
+  border-radius: 6px;
+  padding: 4px 8px;
+  cursor: pointer;
+  font-size: 14px;
+}
+#model-refresh-btn:hover { color: var(--text); border-color: var(--accent); }
 #clear-btn {
   background: transparent;
   color: var(--text-dim);
@@ -355,6 +451,19 @@ pre .code-copy-btn.copied { background: #2d5a3d; color: #4ade80; opacity: 1; }
 .msg:hover .msg-copy-btn { opacity: 0.5; }
 .msg-copy-btn:hover { opacity: 1 !important; }
 .msg-copy-btn.copied { opacity: 1 !important; color: #4ade80; }
+
+/* Token stats bar below assistant messages */
+.msg-stats {
+  margin-top: 6px;
+  padding: 4px 10px;
+  font-size: 11px;
+  color: var(--text-dim);
+  border-top: 1px solid rgba(255,255,255,0.05);
+  font-family: monospace;
+  white-space: nowrap;
+  overflow-x: auto;
+}
+
 a { color: #60a5fa; text-decoration: none; }
 a:hover { text-decoration: underline; }
 /* Settings modal */
@@ -460,11 +569,21 @@ a:hover { text-decoration: underline; }
   <div style="display: flex; align-items: center; gap: 10px;">
     <button id="sidebar-toggle" onclick="toggleSidebar()" style="background: none; border: none; color: var(--text-dim); cursor: pointer; font-size: 18px; padding: 4px;">☰</button>
     <div>
-      <h1>&#129302; Qwen3.6-27B Chat</h1>
-      <div class="subtitle"><span id="status-dot"></span><span id="status-text">Connecting...</span></div>
+      <h1>&#129302; LAN Chat</h1>
+      <div class="subtitle">
+        <div class="status-row">
+          <div class="status-item"><span id="dot-server" class="dot"></span>Server</div>
+          <div class="status-item"><span id="dot-proxy" class="dot"></span>Proxy</div>
+          <div class="status-item"><span id="dot-vllm" class="dot"></span><span id="vllm-label">vLLM</span></div>
+        </div>
+      </div>
     </div>
   </div>
   <div id="controls">
+    <select id="model-select" onchange="onModelChange()" title="Select model">
+      <option value="">Loading models...</option>
+    </select>
+    <button id="model-refresh-btn" onclick="loadModels()" title="Refresh model list">↻</button>
     <label><input type="checkbox" id="think-toggle" checked> Thinking</label>
     <button id="gear-btn" onclick="openSettings()" title="System prompt settings">⚙</button>
     <button id="clear-btn" onclick="clearChat()">Clear</button>
@@ -513,10 +632,13 @@ a:hover { text-decoration: underline; }
 
 <script>
 const API_URL = '/chat';
+const VLLM_MODELS_URL = '/models';
+const VLLM_REFRESH_URL = '/refresh';
 let messages = [];
 let busy = false;
 let conversations = [];      // [{id, title, messages}]
 let activeConvId = null;
+let selectedModel = localStorage.getItem('chat-selected-model') || '';
 let abortController = null;  // AbortController for the active fetch, if any
 let systemPrompt = '';       // Custom system prompt (localStorage)
 let includeDatetime = true;  // Inject current date/time into system prompt
@@ -638,7 +760,7 @@ function switchConversation(convId) {
   chat.innerHTML = '';
   for (const msg of conv.messages) {
     if (msg.role === 'user') addMsg('user', msg.content);
-    else if (msg.role === 'assistant') addMsg('assistant', msg.content);
+    else if (msg.role === 'assistant') addMsg('assistant', msg.content, msg.reasoning);
   }
   renderConvList();
   document.getElementById('prompt').focus();
@@ -714,15 +836,42 @@ function stopGeneration() {
   }
 }
 
-// ── Check server status ─────────────────────────────────────────────────────
-fetch('/chat.html')
-  .then(r => {
-    document.getElementById('status-dot').classList.add('online');
-    document.getElementById('status-text').textContent = 'Online · Web Search Enabled';
-  })
-  .catch(() => {
-    document.getElementById('status-text').textContent = 'Offline — check server';
-  });
+// ── Check server status (poll every 10s) ─────────────────────────────────────
+function setDot(id, up) {
+  const dot = document.getElementById(id);
+  if (!dot) return;
+  dot.classList.toggle('up', up);
+  dot.classList.toggle('down', !up);
+}
+
+async function checkHealth() {
+  const serverUp = true; // if this JS runs, the server is serving the page
+
+  try {
+    const resp = await fetch('/health', { cache: 'no-cache' });
+    if (!resp.ok) throw new Error('health endpoint failed');
+    const data = await resp.json();
+
+    setDot('dot-server', data.server === true);
+    setDot('dot-proxy', data.proxy === true);
+    setDot('dot-vllm', data.vllm === true);
+
+    // Show loaded model name next to vLLM dot
+    const vllmLabel = document.getElementById('vllm-label');
+    if (vllmLabel) {
+      vllmLabel.textContent = data.loaded_model
+        ? data.loaded_model.replace(/-FP8$/, '').replace('Qwen3.6-27B-', '')
+        : 'vLLM';
+    }
+  } catch {
+    setDot('dot-server', false);
+    setDot('dot-proxy', false);
+    setDot('dot-vllm', false);
+  }
+}
+
+checkHealth();
+setInterval(checkHealth, 10000);
 
 function autoResize(el) {
   el.style.height = 'auto';
@@ -836,7 +985,7 @@ function enhanceCodeBlocks(container) {
   }
 }
 
-function addMsg(role, content) {
+function addMsg(role, content, reasoning) {
   const chat = document.getElementById('chat');
   const div = document.createElement('div');
   div.className = 'msg ' + role;
@@ -845,18 +994,25 @@ function addMsg(role, content) {
   tag.textContent = role === 'user' ? 'You' : 'Assistant';
   const body = document.createElement('div');
   // Placeholder HTML (starts with '<') is set directly; everything else is formatted
-  if (content.startsWith('<')) {
+  if (content && content.startsWith('<')) {
     body.innerHTML = content;
   } else {
-    body.innerHTML = formatContent(content);
+    let bodyHtml = '';
+    if (reasoning) {
+      bodyHtml += `<details class="thinking-block"><summary class="thinking-summary">💭 Thought process</summary><div class="thinking-content">${escapeHtml(reasoning)}</div></details>`;
+    }
+    bodyHtml += `<div class="msg-content">${formatContent(content || '')}</div>`;
+    body.innerHTML = bodyHtml;
   }
   enhanceCodeBlocks(body);
-  // Message-level copy button — reads body.textContent at click time,
-  // so it captures the final rendered text even after streaming replaces it
+  // Message-level copy button — prefers .msg-content text
   const copyBtn = document.createElement('button');
   copyBtn.className = 'msg-copy-btn';
   copyBtn.textContent = '📋';
-  copyBtn.onclick = () => copyToClipboard(body.textContent, copyBtn);
+  copyBtn.onclick = () => {
+    const msgContent = body.querySelector('.msg-content');
+    copyToClipboard(msgContent ? msgContent.textContent : body.textContent, copyBtn);
+  };
   tag.appendChild(copyBtn);
   div.appendChild(tag);
   div.appendChild(body);
@@ -958,14 +1114,20 @@ async function sendMessage() {
 
   abortController = new AbortController();
   let contentText = '';
+  let reasoningText = '';
+  let thinkingBlock = null;
+  let thinkingSummary = null;
+  let thinkingContent = null;
+  let msgContent = null;
 
   try {
     const response = await fetch(API_URL, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        messages: messages,
+        messages: messages.map(m => ({ role: m.role, content: m.content })),
         thinking: thinking,
+        model: selectedModel || undefined,
         system_prompt: systemPrompt,
         include_datetime: includeDatetime,
         include_search: includeSearch,
@@ -993,14 +1155,43 @@ async function sendMessage() {
         try {
           const event = JSON.parse(data);
 
-          if (event.type === 'content') {
+          if (event.type === 'reasoning') {
+            if (!thinkingBlock) {
+              assistantBody.innerHTML =
+                '<details class="thinking-block" open>' +
+                  '<summary class="thinking-summary">💭 Thinking...</summary>' +
+                  '<div class="thinking-content"></div>' +
+                '</details>' +
+                '<div class="msg-content"></div>';
+              thinkingBlock = assistantBody.querySelector('.thinking-block');
+              thinkingSummary = assistantBody.querySelector('.thinking-summary');
+              thinkingContent = assistantBody.querySelector('.thinking-content');
+              msgContent = assistantBody.querySelector('.msg-content');
+            }
+            reasoningText += event.text;
+            thinkingContent.textContent = reasoningText;
+            thinkingContent.scrollTop = thinkingContent.scrollHeight;
+            document.getElementById('chat').scrollTop = document.getElementById('chat').scrollHeight;
+          }
+          else if (event.type === 'content') {
+            if (thinkingBlock && thinkingBlock.hasAttribute('open')) {
+              thinkingBlock.removeAttribute('open');
+              if (thinkingSummary) thinkingSummary.textContent = '💭 Thought process';
+            }
+            if (!msgContent) {
+              assistantBody.innerHTML = '<div class="msg-content"></div>';
+              msgContent = assistantBody.querySelector('.msg-content');
+            }
             contentText += event.text;
-            assistantBody.innerHTML = formatContent(contentText);
-            enhanceCodeBlocks(assistantBody);
+            msgContent.innerHTML = formatContent(contentText);
+            enhanceCodeBlocks(msgContent);
             document.getElementById('chat').scrollTop = document.getElementById('chat').scrollHeight;
           }
           else if (event.type === 'tool_call') {
-            // Clear the "Thinking..." placeholder before showing tool
+            if (thinkingBlock && thinkingBlock.hasAttribute('open')) {
+              thinkingBlock.removeAttribute('open');
+              if (thinkingSummary) thinkingSummary.textContent = '💭 Thought process';
+            }
             assistantBody.remove();
             addToolIndicator(event.query, null);
           }
@@ -1042,11 +1233,43 @@ async function sendMessage() {
             }
             // Re-add the assistant placeholder
             assistantBody = addMsg('assistant', '<div class="typing-indicator"><span>Processing results</span><span class="typing-dots"><span></span><span></span><span></span></span></div>');
+            thinkingBlock = null;
+            thinkingSummary = null;
+            thinkingContent = null;
+            msgContent = null;
             document.getElementById('chat').scrollTop = document.getElementById('chat').scrollHeight;
           }
+          else if (event.type === 'stats') {
+            if (thinkingSummary && event.thinking_time_s > 0) {
+              thinkingSummary.textContent = `💭 Thought for ${event.thinking_time_s}s`;
+            }
+            // Render token stats below the assistant message
+            const msgDiv = assistantBody.closest('.msg');
+            if (msgDiv) {
+              let statsEl = msgDiv.querySelector('.msg-stats');
+              if (!statsEl) {
+                statsEl = document.createElement('div');
+                statsEl.className = 'msg-stats';
+                msgDiv.appendChild(statsEl);
+              }
+              let parts = [];
+              if (event.thinking_tokens > 0) {
+                parts.push(`💭 ${event.thinking_tokens} tok · ${event.thinking_tps} t/s · ${event.thinking_time_s}s`);
+              }
+              parts.push(`💬 ${event.content_tokens} tok · ${event.content_tps} t/s · ${event.content_time_s}s`);
+              parts.push(`⚡ ${event.total_tps} t/s total`);
+              parts.push(`⏱ ${event.gen_time_s}s`);
+              statsEl.textContent = parts.join('  ·  ');
+            }
+          }
           else if (event.type === 'done') {
-            // Finalize
-            messages.push({ role: 'assistant', content: contentText });
+            if (thinkingBlock && thinkingBlock.hasAttribute('open')) {
+              thinkingBlock.removeAttribute('open');
+              if (thinkingSummary) thinkingSummary.textContent = '💭 Thought process';
+            }
+            const assistantMsg = { role: 'assistant', content: contentText };
+            if (reasoningText) assistantMsg.reasoning = reasoningText;
+            messages.push(assistantMsg);
             updateActiveConvMessages();
             gotDone = true;
           }
@@ -1064,10 +1287,14 @@ async function sendMessage() {
   } catch (e) {
     if (e.name === 'AbortError') {
       // User clicked Stop — save whatever partial content we have
-      if (contentText && contentText.trim()) {
-        assistantBody.innerHTML = formatContent(contentText);
-        enhanceCodeBlocks(assistantBody);
-        messages.push({ role: 'assistant', content: contentText });
+      if ((contentText && contentText.trim()) || (reasoningText && reasoningText.trim())) {
+        if (thinkingBlock && thinkingBlock.hasAttribute('open')) {
+          thinkingBlock.removeAttribute('open');
+          if (thinkingSummary) thinkingSummary.textContent = '💭 Thought process';
+        }
+        const assistantMsg = { role: 'assistant', content: contentText };
+        if (reasoningText) assistantMsg.reasoning = reasoningText;
+        messages.push(assistantMsg);
         updateActiveConvMessages();
       } else if (assistantBody) {
         // No content received — remove the empty placeholder
@@ -1095,8 +1322,45 @@ if (activeConvId) {
 } else {
   newChat();
 }
+loadModels();
 
 document.getElementById('prompt').focus();
+
+// ── Model selection ────────────────────────────────────────────────────────
+async function loadModels() {
+  const select = document.getElementById('model-select');
+  const btn = document.getElementById('model-refresh-btn');
+  if (btn) { btn.style.transform = 'rotate(360deg)'; btn.style.transition = 'transform 0.5s'; setTimeout(() => { btn.style.transform = ''; btn.style.transition = ''; }, 500); }
+  try {
+    // Tell proxy to re-read its YAML config (picks up newly added models)
+    await fetch(VLLM_REFRESH_URL, { method: 'POST' }).catch(() => {});
+    const resp = await fetch(VLLM_MODELS_URL);
+    const data = await resp.json();
+    select.innerHTML = '';
+    data.data.forEach(m => {
+      const opt = document.createElement('option');
+      opt.value = m.id;
+      opt.textContent = m.id;
+      if (m.loaded) opt.textContent += ' ✓';
+      select.appendChild(opt);
+    });
+    const loaded = data.data.find(m => m.loaded);
+    if (selectedModel && data.data.find(m => m.id === selectedModel)) {
+      select.value = selectedModel;
+    } else if (loaded) {
+      select.value = loaded.id;
+      selectedModel = loaded.id;
+    }
+  } catch (e) {
+    console.error('Failed to load models:', e);
+    select.innerHTML = '<option value="">Default</option>';
+  }
+}
+
+function onModelChange() {
+  selectedModel = document.getElementById('model-select').value;
+  localStorage.setItem('chat-selected-model', selectedModel);
+}
 // Escape closes settings modal
 document.addEventListener('keydown', (e) => {
   if (e.key === 'Escape') closeSettings();
