@@ -531,21 +531,37 @@ class ChatHandler(http.server.SimpleHTTPRequestHandler):
             self.end_headers()
 
     def _handle_health(self):
-        """Check proxy and vLLM backend health, return JSON status."""
+        """Check proxy and vLLM backend health, return JSON status.
+
+        Works with both the vLLM Swap Proxy (rich model metadata) and
+        raw vLLM (plain /v1/models response).
+        """
         result = {"server": True, "proxy": False, "vllm": False,
                   "loaded_model": None}
-        # Check swap proxy
         try:
             req = urllib.request.Request(f"{VLLM_BASE}/v1/models")
             with urllib.request.urlopen(req, timeout=3) as resp:
-                result["proxy"] = True
                 data = json.loads(resp.read())
-                # Find loaded model
-                for m in data.get("data", []):
-                    if m.get("owned_by") == "local":
-                        result["vllm"] = True
-                        result["loaded_model"] = m.get("id")
-                        break
+                models = data.get("data", [])
+
+                # Swap proxy returns "owned_by": "local" or "passthrough"
+                # and a "loaded" boolean. Raw vLLM returns "owned_by": "vllm".
+                is_proxy = any(
+                    m.get("owned_by") in ("local", "passthrough")
+                    for m in models
+                )
+
+                if is_proxy:
+                    result["proxy"] = True
+                    for m in models:
+                        if m.get("owned_by") == "local" and m.get("loaded"):
+                            result["vllm"] = True
+                            result["loaded_model"] = m.get("id")
+                            break
+                elif models:
+                    # Raw vLLM — any model in the list means vLLM is up
+                    result["vllm"] = True
+                    result["loaded_model"] = models[0].get("id")
         except Exception:
             pass
         self.send_response(200)
