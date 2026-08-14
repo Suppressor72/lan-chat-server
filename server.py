@@ -21,6 +21,26 @@ WEB_DIR = os.path.dirname(os.path.abspath(__file__))
 VLLM_BASE = "http://127.0.0.1:8001"
 MODEL = "Qwen3.8-27B-FP8"
 
+# API key for the swap proxy / vLLM backends (tunnel exposure). Empty → "EMPTY"
+# (vLLM ignores auth headers when --api-key is unset, so this is always safe to send).
+# Key file: VLLM_API_KEY_FILE env var, or ../secrets/vllm-api-key.env relative to
+# this script (web/../secrets/). Never hardcode the key in source.
+_API_KEY = os.environ.get("VLLM_API_KEY", "EMPTY")
+if _API_KEY == "EMPTY":
+    _key_file = os.environ.get(
+        "VLLM_API_KEY_FILE",
+        os.path.join(os.path.dirname(WEB_DIR), "secrets", "vllm-api-key.env"),
+    )
+    try:
+        with open(_key_file) as f:
+            for _line in f:
+                if _line.startswith("VLLM_API_KEY="):
+                    _API_KEY = _line.split("=", 1)[1].strip()
+                    break
+    except FileNotFoundError:
+        pass
+VLLM_API_KEY = _API_KEY
+
 # ── Page-fetching config ──────────────────────────────────────────────────────
 MAX_PAGES_TO_FETCH = 5       # how many result pages to read in full
 MAX_PAGE_CHARS = 4000        # truncate each page to this many chars for the model
@@ -273,7 +293,7 @@ def vllm_stream(messages: list[dict], thinking: bool = True, model: str | None =
     req = urllib.request.Request(
         f"{VLLM_BASE}/v1/chat/completions",
         data=payload,
-        headers={"Content-Type": "application/json", "Authorization": "Bearer EMPTY"},
+        headers={"Content-Type": "application/json", "Authorization": f"Bearer {VLLM_API_KEY}"},
     )
     with urllib.request.urlopen(req, timeout=120) as resp:
         for raw_line in resp:
@@ -565,7 +585,10 @@ class ChatHandler(http.server.SimpleHTTPRequestHandler):
         result = {"server": True, "proxy": False, "vllm": False,
                   "loaded_model": None}
         try:
-            req = urllib.request.Request(f"{VLLM_BASE}/v1/models")
+            req = urllib.request.Request(
+                f"{VLLM_BASE}/v1/models",
+                headers={"Authorization": f"Bearer {VLLM_API_KEY}"},
+            )
             with urllib.request.urlopen(req, timeout=3) as resp:
                 data = json.loads(resp.read())
                 models = data.get("data", [])
@@ -599,7 +622,10 @@ class ChatHandler(http.server.SimpleHTTPRequestHandler):
     def _proxy_get(self, backend_path):
         """Proxy a GET request to vLLM swap proxy."""
         try:
-            req = urllib.request.Request(f"{VLLM_BASE}{backend_path}")
+            req = urllib.request.Request(
+                f"{VLLM_BASE}{backend_path}",
+                headers={"Authorization": f"Bearer {VLLM_API_KEY}"},
+            )
             with urllib.request.urlopen(req, timeout=5) as resp:
                 self.send_response(resp.status)
                 self.send_header('Content-Type', 'application/json')
@@ -619,7 +645,8 @@ class ChatHandler(http.server.SimpleHTTPRequestHandler):
             req = urllib.request.Request(
                 f"{VLLM_BASE}{backend_path}",
                 data=body,
-                headers={"Content-Type": "application/json"},
+                headers={"Content-Type": "application/json",
+                         "Authorization": f"Bearer {VLLM_API_KEY}"},
                 method="POST",
             )
             with urllib.request.urlopen(req, timeout=10) as resp:
