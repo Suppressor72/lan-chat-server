@@ -1,13 +1,13 @@
 # LAN Chat Server
 
-A lightweight chat UI for any OpenAI-compatible LLM API (vLLM, Ollama, etc.) with built-in web search tool use. Pure Python stdlib — no npm, no Docker, no external dependencies.
+A lightweight chat UI for any OpenAI-compatible LLM API (vLLM, Ollama, etc.) with optional built-in web search tool use. The core server uses only the Python standard library; web search additionally requires `ddgs`.
 
-![Architecture](https://img.shields.io/badge/python-3.10+-blue) ![Dependencies](https://img.shields.io/badge/dependencies-zero-success)
+![Architecture](https://img.shields.io/badge/python-3.10+-blue) ![Dependencies](https://img.shields.io/badge/core-stdlib_only-success) ![Web Search](https://img.shields.io/badge/web_search-ddgs_optional-informational)
 
 ## Features
 
 - **Single-file server** (`server.py`) — serves the chat UI, proxies LLM API calls, handles web search tool use, and detects client disconnects during streaming
-- **Autonomous web search** — the model decides when to search, fetches full page content (not just snippets), and synthesizes answers with citations
+- **Optional autonomous web search** — when enabled, the model decides when to search, fetches full page content (not just snippets), and synthesizes answers with citations
 - **Server-Sent Events streaming** — responses stream to the browser as they're generated
 - **Multi-turn conversations** — full conversation history saved in `localStorage`, survives page reloads
 - **Reasoning token streaming** — live thinking/reasoning tokens render in a collapsible block during generation, auto-collapse when content begins, persisted with conversation history
@@ -20,7 +20,7 @@ A lightweight chat UI for any OpenAI-compatible LLM API (vLLM, Ollama, etc.) wit
 - **Markdown rendering** — links, bold, inline/block code with copy buttons, GFM tables (dark-themed, content-width)
 - **System prompt customization** — gear icon opens settings for custom system prompt, date/time injection, and web search toggle
 - **LAN accessible** — any browser on your network can connect
-- **Zero dependencies** — runs on Python stdlib only (http.server, urllib, socketserver)
+- **Stdlib-only core** — with web search disabled, the server runs on Python stdlib only (`http.server`, `urllib`, `socketserver`, etc.); `ddgs` is imported only when a search is actually requested
 
 ## How It Works
 
@@ -29,7 +29,7 @@ Browser (chat.html)
     │
     │ POST /chat (SSE stream)  ·  GET /models  ·  GET /health
     ▼
-server.py ─── DuckDuckGo Search ─── Page Fetching (parallel)
+server.py ─── ddgs Search (optional) ─── Page Fetching (parallel)
     │
     │ POST /v1/chat/completions  ·  GET /v1/models
     ▼
@@ -39,7 +39,9 @@ Swap Proxy (:8001) ─── routes to correct backend, hot-swaps via systemd
     └──▶ vLLM Backend B (:8003)
 ```
 
-The server acts as a middleman between the browser and your LLM. When the model decides it needs current information, it emits a `[[search]]query[[/search]]` marker. The server intercepts this, runs a DuckDuckGo search, fetches the top 5 result pages in parallel, strips them to clean text, and feeds them back to the model as tool results. The model then synthesizes a cited answer from the actual page content.
+The server acts as a middleman between the browser and your LLM. When web search is enabled and the model decides it needs current information, it emits a `[[search]]query[[/search]]` marker. The server uses `ddgs` to search, fetches the top 5 result pages in parallel, strips them to clean text, and feeds them back to the model as tool results. The model then synthesizes a cited answer from the actual page content.
+
+Web search can be disabled per browser in Settings. When disabled, the server does not advertise the search tool to the model, does not call the search path, and never imports `ddgs`.
 
 When used with a swap proxy (any OpenAI-compatible reverse proxy), the chat server's `/models` endpoint discovers available backends and the dropdown lets you switch between them. The swap proxy handles stopping the current backend and starting the requested one. The `/health` endpoint checks proxy reachability and reports which model is currently loaded.
 
@@ -60,6 +62,12 @@ MODEL = "your-model-name"              # Model name your API serves
 python3 server.py
 ```
 
+This requires no third-party Python packages when Web Search is disabled in the UI. To enable web search, install the optional dependency in the same Python environment used to run the server:
+
+```bash
+python3 -m pip install ddgs
+```
+
 ### 3. Open in browser
 
 ```
@@ -69,9 +77,9 @@ http://<your-lan-ip>:8080      # From another machine on your network
 
 ## Web Search Details
 
-The search pipeline:
+When enabled, the search pipeline is:
 
-1. **DuckDuckGo HTML scraping** — no API key required, no rate limits to manage
+1. **`ddgs` multi-backend search** — no API key required; replaces direct DuckDuckGo HTML scraping, which is blocked by an anomaly/bot challenge
 2. **Parallel page fetching** — top 5 result pages fetched concurrently (~2-3s total)
 3. **HTML-to-text extraction** — strips scripts, styles, nav, and boilerplate; keeps content
 4. **Truncation** — each page capped at 4,000 chars to fit model context window
@@ -81,6 +89,7 @@ Tunable parameters at the top of `server.py`:
 ```python
 MAX_PAGES_TO_FETCH = 5       # How many result pages to read
 MAX_PAGE_CHARS = 4000        # Max chars per page sent to model
+MAX_SEARCH_ITERATIONS = 8    # Search rounds before forcing a final answer
 PAGE_FETCH_TIMEOUT = 8       # Seconds per page fetch
 ```
 
@@ -88,6 +97,7 @@ PAGE_FETCH_TIMEOUT = 8       # Seconds per page fetch
 
 - Python 3.10+
 - Any OpenAI-compatible `/v1/chat/completions` endpoint (vLLM, Ollama, LM Studio, text-generation-webui, etc.)
+- Optional: `ddgs` for web search. It is not imported or required when Web Search is disabled.
 
 ## Files
 

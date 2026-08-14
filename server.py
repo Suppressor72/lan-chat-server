@@ -19,11 +19,12 @@ from datetime import datetime
 PORT = 8080
 WEB_DIR = os.path.dirname(os.path.abspath(__file__))
 VLLM_BASE = "http://127.0.0.1:8001"
-MODEL = "ThinkingCap-Qwen3.6-27B-FP8"
+MODEL = "Qwen3.8-27B-FP8"
 
 # ── Page-fetching config ──────────────────────────────────────────────────────
 MAX_PAGES_TO_FETCH = 5       # how many result pages to read in full
 MAX_PAGE_CHARS = 4000        # truncate each page to this many chars for the model
+MAX_SEARCH_ITERATIONS = 8    # max [[search]] rounds per user turn before forcing an answer
 PAGE_FETCH_TIMEOUT = 8       # seconds per page fetch
 
 # ── Tool-use system prompt ────────────────────────────────────────────────────
@@ -83,63 +84,48 @@ def build_system_prompt(
 
     return "\n\n".join(parts)
 
-# ── DuckDuckGo search (no API key) ────────────────────────────────────────────
+# ── Web search (optional ddgs dependency) ──────────────────────────────────────────────
 def search_web(query: str, num_results: int = 5) -> list[dict]:
-    """Search DuckDuckGo and return results as [{title, url, snippet}]."""
-    results = []
+    """Search the web and return results as [{title, url, snippet}].
+
+    ``ddgs`` is imported lazily so the server remains stdlib-only when the user
+    disables web search. Direct html.duckduckgo.com scraping currently returns
+    an anomaly/challenge page with zero ``result__a`` links.
+    """
+    results: list[dict] = []
     try:
-        url = f"https://html.duckduckgo.com/html/?q={urllib.parse.quote(query)}"
-        req = urllib.request.Request(url, headers={
-            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Accept-Language": "en-US,en;q=0.9",
-        })
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            html = resp.read().decode("utf-8", errors="replace")
+        from ddgs import DDGS
+    except ImportError:
+        return [{
+            "title": "Web search unavailable",
+            "url": "",
+            "snippet": (
+                "The optional 'ddgs' package is not installed. Install it in "
+                "the Python environment running this server, or disable Web "
+                "Search in Settings."
+            ),
+        }]
 
-        # Parse DuckDuckGo HTML results.
-        # DDG markup changes frequently — use a robust approach that handles
-        # attributes in any order (rel="nofollow" may precede class=).
-        # Result blocks: <a ... class="result__a" ... href="...">Title</a>
-        #                 <a ... class="result__snippet" ...>Snippet</a>
-        link_pattern = re.compile(
-            r'<a\s+[^>]*class="result__a"[^>]*>(.*?)</a>', re.DOTALL
-        )
-        snippet_pattern = re.compile(
-            r'<a\s+[^>]*class="result__snippet"[^>]*>(.*?)</a>', re.DOTALL
-        )
-        href_pattern = re.compile(r'href="([^"]*)"')
-
-        # Find all result links, then grab the next snippet after each
-        link_iter = list(link_pattern.finditer(html))
-        snippet_iter = list(snippet_pattern.finditer(html))
-
-        for i, link_match in enumerate(link_iter):
-            link_html = link_match.group(0)
-            title = re.sub(r"<[^>]+>", "", link_match.group(1)).strip()
-
-            # Extract real URL from DDG redirect (href may contain uddg= param)
-            href_match = href_pattern.search(link_html)
-            real_url = ""
-            if href_match:
-                raw_href = href_match.group(1)
-                uddg = re.search(r"uddg=([^&\"]*)", raw_href)
-                if uddg:
-                    real_url = urllib.parse.unquote(uddg.group(1))
-
-            # Match snippet — the closest one after this link
-            snippet = ""
-            for sm in snippet_iter:
-                if sm.start() > link_match.start():
-                    snippet = re.sub(r"<[^>]+>", "", sm.group(1)).strip()
-                    break
-
-            results.append({"title": title, "url": real_url, "snippet": snippet})
+    try:
+        with DDGS() as ddgs:
+            raw = list(ddgs.text(query, max_results=num_results, backend="auto"))
+        for item in raw:
+            url = (item.get("href") or item.get("link") or item.get("url") or "").strip()
+            title = (item.get("title") or "").strip() or url
+            snippet = (item.get("body") or item.get("snippet") or "").strip()
+            if not url:
+                continue
+            results.append({"title": title, "url": url, "snippet": snippet})
             if len(results) >= num_results:
                 break
     except Exception as e:
         results = [{"title": "Search error", "url": "", "snippet": str(e)}]
 
-    return results if results else [{"title": "No results", "url": "", "snippet": f"No results found for: {query}"}]
+    return results if results else [{
+        "title": "No results",
+        "url": "",
+        "snippet": f"No results found for: {query}",
+    }]
 
 
 def format_search_results(results: list[dict]) -> str:
@@ -314,6 +300,15 @@ def vllm_stream(messages: list[dict], thinking: bool = True, model: str | None =
 _HOLD_BACK = len("[[/search]]")  # 10
 
 
+FORCE_ANSWER_PROMPT = (
+    "You have reached the maximum number of web searches for this turn. "
+    "Answer the user's question now using only the search results already "
+    "provided above. Do not output [[search]] or [[/search]] markers. "
+    "If the results are incomplete, give the best answer you can and note "
+    "what is still uncertain."
+)
+
+
 def run_chat(
     messages: list[dict],
     thinking: bool,
@@ -328,6 +323,7 @@ def run_chat(
     Tokens are streamed to the client in real-time. When include_search is True,
     a hold-back buffer prevents partial [[search]] markers from leaking; on
     detection, streaming pauses, the search runs, and results are fed back.
+    After MAX_SEARCH_ITERATIONS searches, one final no-search round forces an answer.
     """
     full_messages = [{
         "role": "system",
@@ -340,139 +336,14 @@ def run_chat(
     total_thinking_time = 0.0
     total_content_time = 0.0
 
-    for iteration in range(5):
-        content = ""
-        reasoning = ""
-        sent_len = 0
-        search_detected = False
-        started = False
-        iter_content_tokens = 0
-        iter_thinking_tokens = 0
-
-        # Per-phase timing: starts on FIRST token (excludes TTFT/prefill)
-        phase_start = None  # set on first token arrival
-        last_phase = None
-
-        for chunk_type, token in vllm_stream(full_messages, thinking, model=model):
-            # Capture usage data (vLLM sends it in the final chunk)
-            if chunk_type == "usage":
-                u = token  # token is actually a dict here
-                iter_content_tokens = u.get("completion_tokens", iter_content_tokens)
-                # vLLM may report reasoning tokens separately in usage
-                iter_thinking_tokens = u.get("reasoning_tokens", 0)
-                if iter_thinking_tokens:
-                    iter_content_tokens = max(0, iter_content_tokens - iter_thinking_tokens)
-                continue
-
-            # Start timer on first actual token (excludes prefill/TTFT)
-            now = time.monotonic()
-            if phase_start is None:
-                phase_start = now
-                last_phase = chunk_type
-
-            # Track phase transitions for accurate per-phase timing
-            if chunk_type != last_phase:
-                if last_phase == "reasoning":
-                    total_thinking_time += now - phase_start
-                elif last_phase == "content":
-                    total_content_time += now - phase_start
-                phase_start = now
-                last_phase = chunk_type
-
-            if chunk_type == "reasoning":
-                reasoning += token
-                if not callback(json.dumps({"type": "reasoning", "text": token})):
-                    return  # client disconnected — abort
-                continue
-            else:
-                content += token
-
-            # Check if client is still connected
-            if not callback(""):
-                return  # client disconnected — abort
-
-            # Suppress leading newlines/whitespace (model often emits blank
-            # lines before the actual answer, especially after tool-use rounds)
-            if not started:
-                stripped = content.lstrip()
-                if stripped:
-                    content = stripped  # discard leading whitespace
-                else:
-                    continue  # all whitespace so far — keep buffering
-
-            # Search markers only honored when web search is enabled
-            if include_search and "[[search]]" in content:
-                search_detected = True
-                started = True
-                marker_idx = content.index("[[search]]")
-                # Flush everything between what was already sent and the marker
-                if marker_idx > sent_len:
-                    chunk = content[sent_len:marker_idx]
-                    callback(json.dumps({"type": "content", "text": chunk}))
-                continue  # keep buffering but don't stream past marker
-
-            if search_detected:
-                continue  # buffering only — marker text is not real content
-
-            # Stream content to client, holding back _HOLD_BACK chars only
-            # when search is enabled (marker may be forming at the edge)
-            hold = _HOLD_BACK if include_search else 0
-            safe_end = max(sent_len, len(content) - hold)
-            if safe_end > sent_len:
-                callback(json.dumps({"type": "content", "text": content[sent_len:safe_end]}))
-                sent_len = safe_end
-                started = True  # real content has begun
-
-        # Stream complete — process the accumulated response
-
-        if include_search and search_detected:
-            # Flush any held-back non-marker content before the marker
-            marker_idx = content.index("[[search]]")
-            if marker_idx > sent_len:
-                callback(json.dumps({"type": "content", "text": content[sent_len:marker_idx]}))
-
-            # Extract search query
-            search_match = re.search(r"\[\[search\]\](.+?)(?:\[\[/search\]\])?$", content, re.DOTALL)
-            if search_match:
-                query = search_match.group(1).replace("[[/search]]", "").strip()
-
-                callback(json.dumps({"type": "tool_call", "tool": "web_search", "query": query}))
-
-                results = search_web(query)
-                pages = fetch_pages_parallel(results)
-                result_text = format_search_results_with_pages(results, pages)
-
-                callback(json.dumps({"type": "tool_result", "tool": "web_search", "results": result_text, "pages_fetched": len(pages)}))
-
-                response_clean = re.sub(r"\[\[/?search\]\]", "", content).strip()
-                full_messages.append({"role": "assistant", "content": response_clean})
-                full_messages.append({"role": "tool", "content": result_text})
-                continue
-            # Edge case: marker detected but regex failed — treat as content
-
-        # No tool call — flush any remaining held-back content, then done
-        content_clean = re.sub(r"\[\[/?search\]\]", "", content) if include_search else content
-        if len(content_clean) > sent_len:
-            callback(json.dumps({"type": "content", "text": content_clean[sent_len:]}))
-        full_messages.append({"role": "assistant", "content": content_clean.strip()})
-
-        # Close out the final phase timing
-        now = time.monotonic()
-        if phase_start is not None:
-            if last_phase == "reasoning":
-                total_thinking_time += now - phase_start
-            elif last_phase == "content":
-                total_content_time += now - phase_start
-
-        # Accumulate token counts
-        total_content_tokens += iter_content_tokens
-        total_thinking_tokens += iter_thinking_tokens
-
-        # Calculate per-phase rates using phase-specific denominators
+    def _finish_and_done():
         total_gen_time = total_thinking_time + total_content_time
         content_tps = total_content_tokens / total_content_time if total_content_time > 0 else 0
         thinking_tps = total_thinking_tokens / total_thinking_time if total_thinking_time > 0 else 0
-        total_tps = (total_content_tokens + total_thinking_tokens) / total_gen_time if total_gen_time > 0 else 0
+        total_tps = (
+            (total_content_tokens + total_thinking_tokens) / total_gen_time
+            if total_gen_time > 0 else 0
+        )
         callback(json.dumps({
             "type": "stats",
             "content_tokens": total_content_tokens,
@@ -485,11 +356,158 @@ def run_chat(
             "gen_time_s": round(total_gen_time, 1),
         }))
         callback(json.dumps({"type": "done"}))
-        return
 
-    # If we hit max iterations
-    callback(json.dumps({"type": "content", "text": "\n[Search iterations exceeded maximum.]"}))
-    callback(json.dumps({"type": "done"}))
+    def _stream_one_round(*, allow_search: bool) -> bool:
+        """Stream one model round. Returns True if a search was run (caller should continue).
+
+        When allow_search is False, [[search]] markers are stripped/ignored and the
+        round always ends with a final answer (or empty content).
+        """
+        nonlocal total_content_tokens, total_thinking_tokens
+        nonlocal total_thinking_time, total_content_time
+
+        content = ""
+        sent_len = 0
+        search_detected = False
+        started = False
+        iter_content_tokens = 0
+        iter_thinking_tokens = 0
+
+        phase_start = None
+        last_phase = None
+
+        for chunk_type, token in vllm_stream(full_messages, thinking, model=model):
+            if chunk_type == "usage":
+                u = token
+                iter_content_tokens = u.get("completion_tokens", iter_content_tokens)
+                iter_thinking_tokens = u.get("reasoning_tokens", 0)
+                if iter_thinking_tokens:
+                    iter_content_tokens = max(0, iter_content_tokens - iter_thinking_tokens)
+                continue
+
+            now = time.monotonic()
+            if phase_start is None:
+                phase_start = now
+                last_phase = chunk_type
+
+            if chunk_type != last_phase:
+                if last_phase == "reasoning":
+                    total_thinking_time += now - phase_start
+                elif last_phase == "content":
+                    total_content_time += now - phase_start
+                phase_start = now
+                last_phase = chunk_type
+
+            if chunk_type == "reasoning":
+                if not callback(json.dumps({"type": "reasoning", "text": token})):
+                    return False
+                continue
+
+            content += token
+
+            if not callback(""):
+                return False
+
+            if not started:
+                stripped = content.lstrip()
+                if stripped:
+                    content = stripped
+                else:
+                    continue
+
+            if allow_search and "[[search]]" in content:
+                search_detected = True
+                started = True
+                marker_idx = content.index("[[search]]")
+                if marker_idx > sent_len:
+                    chunk = content[sent_len:marker_idx]
+                    callback(json.dumps({"type": "content", "text": chunk}))
+                continue
+
+            if search_detected:
+                continue
+
+            hold = _HOLD_BACK if allow_search else 0
+            safe_end = max(sent_len, len(content) - hold)
+            if safe_end > sent_len:
+                callback(json.dumps({"type": "content", "text": content[sent_len:safe_end]}))
+                sent_len = safe_end
+                started = True
+
+        if allow_search and search_detected:
+            marker_idx = content.index("[[search]]")
+            if marker_idx > sent_len:
+                callback(json.dumps({"type": "content", "text": content[sent_len:marker_idx]}))
+
+            search_match = re.search(
+                r"\[\[search\]\](.+?)(?:\[\[/search\]\])?$", content, re.DOTALL
+            )
+            if search_match:
+                query = search_match.group(1).replace("[[/search]]", "").strip()
+
+                callback(json.dumps({"type": "tool_call", "tool": "web_search", "query": query}))
+
+                results = search_web(query)
+                pages = fetch_pages_parallel(results)
+                result_text = format_search_results_with_pages(results, pages)
+
+                callback(json.dumps({
+                    "type": "tool_result",
+                    "tool": "web_search",
+                    "results": result_text,
+                    "pages_fetched": len(pages),
+                }))
+
+                response_clean = re.sub(r"\[\[/?search\]\]", "", content).strip()
+                full_messages.append({"role": "assistant", "content": response_clean})
+                full_messages.append({"role": "tool", "content": result_text})
+
+                # Close timing for this search-only round (no final answer yet)
+                now = time.monotonic()
+                if phase_start is not None:
+                    if last_phase == "reasoning":
+                        total_thinking_time += now - phase_start
+                    elif last_phase == "content":
+                        total_content_time += now - phase_start
+                total_content_tokens += iter_content_tokens
+                total_thinking_tokens += iter_thinking_tokens
+                return True
+            # Marker detected but regex failed — fall through as content
+
+        content_clean = re.sub(r"\[\[/?search\]\]", "", content) if allow_search else content
+        # Force-answer round: strip any accidental search markers the model still emitted
+        if not allow_search:
+            content_clean = re.sub(r"\[\[/?search\]\].*", "", content_clean, flags=re.DOTALL)
+            content_clean = re.sub(r"\[\[/?search\]\]", "", content_clean)
+
+        if len(content_clean) > sent_len:
+            callback(json.dumps({"type": "content", "text": content_clean[sent_len:]}))
+        full_messages.append({"role": "assistant", "content": content_clean.strip()})
+
+        now = time.monotonic()
+        if phase_start is not None:
+            if last_phase == "reasoning":
+                total_thinking_time += now - phase_start
+            elif last_phase == "content":
+                total_content_time += now - phase_start
+
+        total_content_tokens += iter_content_tokens
+        total_thinking_tokens += iter_thinking_tokens
+        _finish_and_done()
+        return False
+
+    for _ in range(MAX_SEARCH_ITERATIONS):
+        searched = _stream_one_round(allow_search=include_search)
+        if not searched:
+            return  # answered (or client disconnected mid-stream after done)
+
+    # Hit search cap — force one final answer with search disabled
+    full_messages.append({"role": "user", "content": FORCE_ANSWER_PROMPT})
+    callback(json.dumps({
+        "type": "content",
+        "text": "\n[Search limit reached — composing answer from results so far.]\n\n",
+    }))
+    _stream_one_round(allow_search=False)
 
 
 # ── HTTP handlers ─────────────────────────────────────────────────────────────
@@ -682,5 +700,5 @@ if __name__ == '__main__':
         print(f"Chat UI serving on http://0.0.0.0:{PORT} (threaded)")
         print(f"Access from LAN: http://<your-ip>:{PORT}")
         print(f"vLLM API at {VLLM_BASE}")
-        print(f"Web search enabled (DuckDuckGo)")
+        print("Web search available when enabled by the user (optional: ddgs)")
         httpd.serve_forever()
