@@ -584,7 +584,12 @@ a:hover { text-decoration: underline; }
       <option value="">Loading models...</option>
     </select>
     <button id="model-refresh-btn" onclick="loadModels()" title="Refresh model list">↻</button>
-    <label><input type="checkbox" id="think-toggle" checked> Thinking</label>
+    <select id="think-level" onchange="onThinkLevelChange()" title="Thinking level">
+      <option value="off">🧠 Off</option>
+      <option value="low">🧠 Low</option>
+      <option value="medium" selected>🧠 Medium</option>
+      <option value="xhigh">🧠 High</option>
+    </select>
     <button id="gear-btn" onclick="openSettings()" title="System prompt settings">⚙</button>
     <button id="clear-btn" onclick="clearChat()">Clear</button>
   </div>
@@ -639,6 +644,7 @@ let busy = false;
 let conversations = [];      // [{id, title, messages}]
 let activeConvId = null;
 let selectedModel = localStorage.getItem('chat-selected-model') || '';
+let thinkLevel = localStorage.getItem('chat-think-level') || 'medium';
 let abortController = null;  // AbortController for the active fetch, if any
 let systemPrompt = '';       // Custom system prompt (localStorage)
 let includeDatetime = true;  // Inject current date/time into system prompt
@@ -1109,7 +1115,7 @@ async function sendMessage() {
   busy = true;
   setBusyState(true);
 
-  const thinking = document.getElementById('think-toggle').checked;
+  const thinking = thinkLevel !== 'off';
   let assistantBody = addMsg('assistant', '<div class="typing-indicator"><span>Thinking</span><span class="typing-dots"><span></span><span></span><span></span></span></div>');
 
   abortController = new AbortController();
@@ -1127,6 +1133,7 @@ async function sendMessage() {
       body: JSON.stringify({
         messages: messages.map(m => ({ role: m.role, content: m.content })),
         thinking: thinking,
+        reasoning_effort: thinking ? thinkLevel : undefined,
         model: selectedModel || undefined,
         system_prompt: systemPrompt,
         include_datetime: includeDatetime,
@@ -1323,6 +1330,8 @@ if (activeConvId) {
   newChat();
 }
 loadModels();
+// Restore persisted thinking level in the dropdown
+document.getElementById('think-level').value = thinkLevel;
 
 document.getElementById('prompt').focus();
 
@@ -1360,6 +1369,11 @@ async function loadModels() {
 function onModelChange() {
   selectedModel = document.getElementById('model-select').value;
   localStorage.setItem('chat-selected-model', selectedModel);
+}
+
+function onThinkLevelChange() {
+  thinkLevel = document.getElementById('think-level').value;
+  localStorage.setItem('chat-think-level', thinkLevel);
 }
 // Escape closes settings modal
 document.addEventListener('keydown', (e) => {

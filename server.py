@@ -247,14 +247,15 @@ def format_search_results_with_pages(results: list[dict], pages: dict) -> str:
 
 
 # ── vLLM helpers ──────────────────────────────────────────────────────────────
-def vllm_stream(messages: list[dict], thinking: bool = True, model: str | None = None):
+def vllm_stream(messages: list[dict], thinking: bool = True, model: str | None = None,
+                reasoning_effort: str | None = None):
     """Stream a completion from vLLM, yielding content/reasoning chunks.
 
     Yields:
         tuple(str, str|dict) — (chunk_type, data) where chunk_type is
         'content', 'reasoning', or 'usage' (data is dict for usage).
     """
-    payload = json.dumps({
+    payload = {
         "model": model or MODEL,
         "messages": messages,
         "max_tokens": 8192,
@@ -263,7 +264,12 @@ def vllm_stream(messages: list[dict], thinking: bool = True, model: str | None =
         "stream": True,
         "stream_options": {"include_usage": True},
         "chat_template_kwargs": {"enable_thinking": thinking},
-    }).encode()
+    }
+    # Qwen3.8+: reasoning_effort (low/medium/xhigh) controls reasoning depth.
+    # Only send when thinking is on — some backends reject unknown params.
+    if thinking and reasoning_effort:
+        payload["reasoning_effort"] = reasoning_effort
+    payload = json.dumps(payload).encode()
     req = urllib.request.Request(
         f"{VLLM_BASE}/v1/chat/completions",
         data=payload,
@@ -317,6 +323,7 @@ def run_chat(
     include_datetime: bool = True,
     include_search: bool = True,
     model: str | None = None,
+    reasoning_effort: str | None = None,
 ):
     """Run the chat loop with optional tool use. Sends SSE events via callback(data_str).
 
@@ -376,7 +383,8 @@ def run_chat(
         phase_start = None
         last_phase = None
 
-        for chunk_type, token in vllm_stream(full_messages, thinking, model=model):
+        for chunk_type, token in vllm_stream(full_messages, thinking, model=model,
+                                             reasoning_effort=reasoning_effort):
             if chunk_type == "usage":
                 u = token
                 iter_content_tokens = u.get("completion_tokens", iter_content_tokens)
@@ -646,6 +654,7 @@ class ChatHandler(http.server.SimpleHTTPRequestHandler):
         include_datetime = body.get("include_datetime", True)
         include_search = body.get("include_search", True)
         model = body.get("model", None)
+        reasoning_effort = body.get("reasoning_effort", None)
 
         self.send_response(200)
         self.send_header('Content-Type', 'text/event-stream')
@@ -688,6 +697,7 @@ class ChatHandler(http.server.SimpleHTTPRequestHandler):
             include_datetime=bool(include_datetime),
             include_search=bool(include_search),
             model=model,
+            reasoning_effort=reasoning_effort,
         )
 
 
